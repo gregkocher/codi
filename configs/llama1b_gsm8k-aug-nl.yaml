@@ -10,7 +10,7 @@ model_args:
 
 # Data Arguments
 data_args:
-  data_name: "icot"
+  data_name: "icot_full"
   max_samples: null
 
 # Wandb Arguments
@@ -26,9 +26,9 @@ hub:
 
 # Training Arguments
 training_args:
-  output_dir: "./models/llama1b_gsm8k-aug"
-  expt_name: "llama1b_gsm8k-aug"
-  logging_dir: "./models/llama1b_gsm8k-aug/logs"
+  output_dir: "./models/llama1b_gsm8k-aug-nl"
+  expt_name: "llama1b_gsm8k-aug-nl"
+  logging_dir: "./models/llama1b_gsm8k-aug-nl/logs"
   logging_steps: 10
   seed: 11
   model_max_length: 512
