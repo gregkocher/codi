@@ -14,12 +14,12 @@ data_args:
     - "icot_full"
     - "strategy"
     - "commonsense"
-  max_samples: null
+  max_samples: 100
 
 # Wandb Arguments
 wandb:
   project: "codi"
-  run_name: "llama1b_gsm8k-strategyqa-commonsense"
+  run_name: "codi_llama1b_gsm8k-strategyqa-commonsense"
 
 # Hub Arguments
 hub:
@@ -29,20 +29,20 @@ hub:
 
 # Training Arguments
 training_args:
-  output_dir: "./models/llama1b_gsm8k-strategyqa-commonsense"
-  expt_name: "llama1b_gsm8k-strategyqa-commonsense"
-  logging_dir: "./models/llama1b_gsm8k-strategyqa-commonsense/logs"
+  output_dir: "./models/codi_llama1b_gsm8k-strategyqa-commonsense"
+  expt_name: "codi_llama1b_gsm8k-strategyqa-commonsense"
+  logging_dir: "./models/codi_llama1b_gsm8k-strategyqa-commonsense/logs"
   logging_steps: 10
   seed: 11
   model_max_length: 512
-  per_device_train_batch_size: 32
-  gradient_accumulation_steps: 1
+  per_device_train_batch_size: 16
+  gradient_accumulation_steps: 2
   bf16: true
   max_steps: -1
   num_train_epochs: 3
   learning_rate: 8e-4
   max_grad_norm: 2.0
-  save_strategy: "no"
+  save_strategy: "epoch"
   save_total_limit: 1
   save_safetensors: false
   weight_decay: 0.1

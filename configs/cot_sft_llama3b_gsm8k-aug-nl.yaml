@@ -1,6 +1,6 @@
 # Model Arguments
 model_args:
-  model_name_or_path: "meta-llama/Llama-3.2-1B-Instruct"
+  model_name_or_path: "meta-llama/Llama-3.2-3B-Instruct"
   lora_r: 128
   lora_alpha: 32
   lora_init: true
@@ -19,7 +19,7 @@ data_args:
 # Wandb Arguments
 wandb:
   project: "codi"
-  run_name: "cot_sft_llama1b_gsm8k-strategyqa-commonsense"
+  run_name: "cot_sft_llama3b_gsm8k-strategyqa-commonsense"
 
 # Hub Arguments
 hub:
@@ -29,9 +29,9 @@ hub:
 
 # Training Arguments
 training_args:
-  output_dir: "./models/cot_sft_llama1b_gsm8k-strategyqa-commonsense"
-  expt_name: "cot_sft_llama1b_gsm8k-strategyqa-commonsense"
-  logging_dir: "./models/cot_sft_llama1b_gsm8k-strategyqa-commonsense/logs"
+  output_dir: "./models/cot_sft_llama3b_gsm8k-strategyqa-commonsense"
+  expt_name: "cot_sft_llama3b_gsm8k-strategyqa-commonsense"
+  logging_dir: "./models/cot_sft_llama3b_gsm8k-strategyqa-commonsense/logs"
   logging_steps: 10
   seed: 11
   model_max_length: 512
