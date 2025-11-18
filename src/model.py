@@ -273,6 +273,14 @@ class CODI(torch.nn.Module):
         if self.training:
             self.init()
 
+    @property
+    def config(self):
+        """Expose the underlying model's config for compatibility with transformers Trainer."""
+        # Handle PEFT-wrapped models
+        if hasattr(self.codi, "get_base_model"):
+            return self.codi.get_base_model().config
+        return self.codi.config
+
     def get_embd(self, model, model_name):
         try:
             if "pythia" in model_name:

@@ -1,0 +1,29 @@
+# Model Arguments
+model_args:
+  model_name_or_path: "meta-llama/Llama-3.2-1B-Instruct"
+  lora_r: 128
+  lora_alpha: 32
+  lora_init: true
+  token: null
+  full_precision: true
+  ckpt_dir: "models/codi_llama1b_full/gsm8k_llama1b_latent_baseline/Llama-3.2-1B-Instruct/ep_10/lr_0.0008/seed_11"
+
+# Data Arguments
+data_args:
+  data_name: "svamp"  # Options: "gsm8k", "gsm-hard", "multi-arith", "svamp", "commonsense"
+  batch_size: 128
+
+# Training Arguments (for inference)
+training_args:
+  model_max_length: 512
+  bf16: true
+  greedy: true
+  num_latent: 6
+  use_prj: true
+  prj_dim: 2048
+  prj_no_ln: false
+  prj_dropout: 0.0
+  inf_latent_iterations: 6
+  inf_num_iterations: 1
+  remove_eos: true
+  use_lora: true
