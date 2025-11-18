@@ -381,13 +381,8 @@ class CODI(torch.nn.Module):
         distill_loss_total = 0
         ce_loss_total = 0
 
-        with torch.no_grad():
-            ref_outputs = self.codi(
-                input_ids=ref_input_ids,
-                output_hidden_states=True,
-                attention_mask=ref_attention_mask,
-            )
-        ref_outputs_with_grad = self.codi(
+        # Single forward pass for reference model (used for both distillation and CE loss)
+        ref_outputs = self.codi(
             input_ids=ref_input_ids,
             output_hidden_states=True,
             attention_mask=ref_attention_mask,
@@ -525,7 +520,7 @@ class CODI(torch.nn.Module):
 
         # Calculate the CE loss for the teacher task
         ref_ce_loss = 0
-        ref_logits = ref_outputs_with_grad.logits
+        ref_logits = ref_outputs.logits
         effective_ref_logits = ref_logits[:, :-1, :]
         effective_ref_logits = effective_ref_logits.reshape(-1, ref_logits.size(-1))
         ref_target_ids = ref_labels[:, 1:].reshape(-1)
@@ -543,12 +538,13 @@ class CODI(torch.nn.Module):
 
         loss = ce_loss_total + distill_loss_total + ref_ce_loss
 
+        # Keep losses as tensors to avoid GPU-CPU synchronization
         if ce_loss_total != 0:
-            ce_loss_total = ce_loss_total.detach().item()
+            ce_loss_total = ce_loss_total.detach()
         if distill_loss_total != 0:
-            distill_loss_total = distill_loss_total.detach().item()
+            distill_loss_total = distill_loss_total.detach()
         if ref_ce_loss != 0:
-            ref_ce_loss = ref_ce_loss.detach().item()
+            ref_ce_loss = ref_ce_loss.detach()
 
         return {
             "loss": loss,
