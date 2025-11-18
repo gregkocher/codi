@@ -207,6 +207,11 @@ class SupervisedDataset(Dataset):
         for num_iter, example in enumerate(raw_data):
             if training_args.exp_mode and num_iter > training_args.exp_data_num:
                 break
+            if (
+                data_args.max_samples is not None
+                and len(questions) >= data_args.max_samples
+            ):
+                break
             question = f"{example['question']}"
             if (
                 "icot" in self.data_name and "full" in self.data_name

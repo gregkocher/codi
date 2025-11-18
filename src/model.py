@@ -18,10 +18,10 @@ class ModelArguments:
     full_precision: bool = field(
         default=True, metadata={"help": "whether use int4 for the base model"}
     )
-    # attn_implementation: str = field(
-    #     default="flash_attention_2",
-    #     metadata={"help": "attention implementation"},
-    # )
+    attn_implementation: str = field(
+        default="flash_attention_2",
+        metadata={"help": "attention implementation"},
+    )
     train: bool = field(
         default=True,
         metadata={
@@ -65,6 +65,12 @@ class DataArguments:
         },
     )
     batch_size: int = field(default=1, metadata={"help": "batch size during inference"})
+    max_samples: Optional[int] = field(
+        default=None,
+        metadata={
+            "help": "Maximum number of samples to use from the dataset. If None, use all samples."
+        },
+    )
 
 
 @dataclass
@@ -195,7 +201,8 @@ class CODI(torch.nn.Module):
                 torch_dtype=(
                     torch.float16 if training_args.bf16 is False else torch.bfloat16
                 ),
-                # attn_implementation=model_args.attn_implementation,
+                attn_implementation=model_args.attn_implementation,
+                device_map="auto",
             )
         else:
             self.codi = model_wrapper_class.from_pretrained(
@@ -203,7 +210,8 @@ class CODI(torch.nn.Module):
                 torch_dtype=(
                     torch.float16 if training_args.bf16 is False else torch.bfloat16
                 ),
-                # attn_implementation=model_args.attn_implementation,
+                attn_implementation=model_args.attn_implementation,
+                device_map="auto",
                 quantization_config=transformers.BitsAndBytesConfig(
                     load_in_4bit=True,
                     bnb_4bit_compute_dtype=torch.bfloat16,
@@ -215,6 +223,9 @@ class CODI(torch.nn.Module):
         ori_vocab_size = self.codi.config.vocab_size
         self.training = self.model_args.train
 
+        # Store the dtype for later use
+        self.dtype = torch.float16 if training_args.bf16 is False else torch.bfloat16
+
         # special tokens to enclose the latent embeddings
         self.pad_token_id = ori_vocab_size
         self.bot_id = ori_vocab_size + 1
@@ -223,6 +234,12 @@ class CODI(torch.nn.Module):
         self.codi.resize_token_embeddings(
             ori_vocab_size + 3
         )  # dummy values for mem tokens
+
+        # Ensure embeddings are in the correct dtype after resizing
+        if hasattr(self.codi, 'get_input_embeddings'):
+            self.codi.get_input_embeddings().to(self.dtype)
+        elif hasattr(self.codi, 'model') and hasattr(self.codi.model, 'embed_tokens'):
+            self.codi.model.embed_tokens.to(self.dtype)
 
         self.dim = self.codi.config.hidden_size
         self.num_latent = training_args.num_latent
@@ -244,6 +261,8 @@ class CODI(torch.nn.Module):
             )
             if not self.prj_no_ln:
                 self.prj.add_module("ln", nn.LayerNorm(self.dim))
+            # Cast projection layer to the correct dtype
+            self.prj.to(self.dtype)
 
         # Losses
         self.print_loss = training_args.print_loss
@@ -345,6 +364,8 @@ class CODI(torch.nn.Module):
         )  # as the next input
         if self.use_prj:
             latent_embd = self.prj(latent_embd)
+        # Ensure latent embeddings are in the correct dtype
+        latent_embd = latent_embd.to(self.dtype)
 
         len_pred_loss = 0
         dynamic_mask = None
@@ -427,11 +448,15 @@ class CODI(torch.nn.Module):
                 latent_embd = outputs.hidden_states[-1][:, -1, :].unsqueeze(1)
                 if self.use_prj:
                     latent_embd = self.prj(latent_embd)
+                # Ensure latent embeddings are in the correct dtype
+                latent_embd = latent_embd.to(self.dtype)
 
                 # Calculate the distillation loss
                 if i == num_latent - 1:  # the last latent embedding
                     # Decode the final answer in natural language
                     embds = self.get_embd(self.codi, self.model_name)(decoder_input_ids)
+                    # Ensure embeddings are in the correct dtype
+                    embds = embds.to(self.dtype)
 
                     if dynamic_mask is not None:  # Prevent attending the paddings
                         decoder_mask = torch.ones(
