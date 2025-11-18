@@ -70,42 +70,6 @@ def create_sft_dataset(train_dataset, model):
     return Dataset.from_list(transformed_data)
 
 
-def create_quantization_config(model_args):
-    """Create BitsAndBytesConfig based on model arguments."""
-    if not hasattr(model_args, "load_in_4bit") and not hasattr(
-        model_args, "load_in_8bit"
-    ):
-        return None
-
-    load_in_4bit = getattr(model_args, "load_in_4bit", False)
-    load_in_8bit = getattr(model_args, "load_in_8bit", False)
-
-    if not load_in_4bit and not load_in_8bit:
-        return None
-
-    if load_in_4bit and load_in_8bit:
-        raise ValueError("Cannot use both 4-bit and 8-bit quantization simultaneously")
-
-    if load_in_4bit:
-        # 4-bit quantization config
-        bnb_config = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_use_double_quant=getattr(
-                model_args, "bnb_4bit_use_double_quant", True
-            ),
-            bnb_4bit_quant_type=getattr(model_args, "bnb_4bit_quant_type", "nf4"),
-            bnb_4bit_compute_dtype=torch.bfloat16,
-        )
-    else:
-        # 8-bit quantization config
-        bnb_config = BitsAndBytesConfig(
-            load_in_8bit=True,
-            llm_int8_threshold=getattr(model_args, "llm_int8_threshold", 6.0),
-        )
-
-    return bnb_config
-
-
 def train():
     parser = argparse.ArgumentParser(description="Train CODI model")
     parser.add_argument("config", type=str, help="Path to YAML config file")
@@ -157,9 +121,7 @@ def train():
     #   Quantization Config  #
     ##########################
     # Check for quantization settings in model_args
-    use_quantization = getattr(model_args, "load_in_4bit", False) or getattr(
-        model_args, "load_in_8bit", False
-    )
+    use_quantization = not model_args.full_precision
 
     # Create quantization config if needed
     quantization_config = None
@@ -175,17 +137,9 @@ def train():
                 if training_args.bf16
                 else torch.float16,
             )
-        elif getattr(model_args, "load_in_8bit", False):
-            quantization_config = BitsAndBytesConfig(
-                load_in_8bit=True,
-                llm_int8_threshold=getattr(model_args, "llm_int8_threshold", 6.0),
-            )
 
         if is_main_process():
-            quant_type = (
-                "4-bit" if getattr(model_args, "load_in_4bit", False) else "8-bit"
-            )
-            print(f"Loading model with {quant_type} quantization using bitsandbytes")
+            print("Loading model with 4bit quantization using bitsandbytes")
 
     ##########################
     #       Peft Model       #
@@ -233,9 +187,6 @@ def train():
         quantization_config=quantization_config,
         dtype=torch.float16 if training_args.bf16 is False else torch.bfloat16,
         attn_implementation=model_args.attn_implementation,
-        device_map="auto"
-        if use_quantization
-        else None,  # Required for quantized models
     )
     ori_vocab_size = model.config.vocab_size
 
@@ -264,6 +215,8 @@ def train():
     else:
         # Other quantization methods (not bitsandbytes)
         model.resize_token_embeddings(ori_vocab_size + 3, mean_resizing=False)
+        if torch.cuda.is_available():
+            model = model.to("cuda")
 
     # Apply LoRA
     if lora_config:
