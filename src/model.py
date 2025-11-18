@@ -55,8 +55,9 @@ class ModelArguments:
 
 @dataclass
 class DataArguments:
-    data_name: str = field(
-        default=None, metadata={"help": "Path to the training data."}
+    data_names: list = field(
+        default_factory=list,
+        metadata={"help": "List of dataset names to concatenate for training."},
     )
     debug_data: bool = field(
         default=False,

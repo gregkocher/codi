@@ -290,7 +290,7 @@ class SupervisedDataset(Dataset):
                 cots.append(cot)
                 answers.append(answer)
                 token_nums.append(token_num)
-            elif "prontoqa" in data_args.data_name:
+            elif "prontoqa" in self.data_name:
                 question = example["question"].strip() + "\n"
                 cot = "\n".join(example["steps"][:-1]) + "\n"
                 answer = f"The answer is: {str(example['answer']).strip()}"
@@ -398,16 +398,57 @@ class DataCollatorForSupervisedDataset(object):
         )
 
 
-def make_supervised_data_module(tokenizer, data_args, model, training_args) -> Dict:
-    """Make dataset and collator for supervised fine-tuning."""
-    logging.warning("Downloading Data")
-    if "icot" in data_args.data_name:
-        if "full" in data_args.data_name:
+def concatenate_datasets(datasets: list) -> SupervisedDataset:
+    """Concatenate multiple SupervisedDataset instances into one."""
+    if not datasets:
+        raise ValueError("Cannot concatenate empty list of datasets")
+
+    if len(datasets) == 1:
+        return datasets[0]
+
+    # Get all keys from the first dataset
+    keys = datasets[0].keys
+
+    # Verify all datasets have the same keys
+    for dataset in datasets[1:]:
+        if dataset.keys != keys:
+            raise ValueError(
+                f"Datasets have different keys. First: {keys}, Current: {dataset.keys}"
+            )
+
+    # Concatenate all data dictionaries
+    concatenated_data_dict = {}
+    for key in keys:
+        concatenated_data_dict[key] = []
+        for dataset in datasets:
+            concatenated_data_dict[key].extend(dataset.data_dict[key])
+
+    # Create a new dataset instance with concatenated data
+    concatenated_dataset = SupervisedDataset.__new__(SupervisedDataset)
+    concatenated_dataset.data_dict = concatenated_data_dict
+    concatenated_dataset.keys = keys
+    concatenated_dataset.data_name = "+".join([ds.data_name for ds in datasets])
+
+    # Calculate total length
+    total_length = sum(len(dataset) for dataset in datasets)
+    print(f"Concatenated {len(datasets)} datasets: {total_length} samples in total")
+
+    return concatenated_dataset
+
+
+def load_single_dataset(
+    data_name: str, tokenizer, model, training_args, data_args
+) -> SupervisedDataset:
+    """Load a single dataset by name and return a SupervisedDataset instance."""
+    logging.warning(f"Loading dataset: {data_name}")
+
+    if "icot" in data_name:
+        if "full" in data_name:
             dataset = load_dataset("zen-E/GSM8k-Aug-NL")["train"]
         else:
             dataset = load_dataset("zen-E/GSM8k-Aug")["train"]
         train_dataset = SupervisedDataset(
-            data_name=data_args.data_name,
+            data_name=data_name,
             raw_data=dataset,
             tokenizer=tokenizer,
             bot=model.bot_id,
@@ -415,16 +456,11 @@ def make_supervised_data_module(tokenizer, data_args, model, training_args) -> D
             training_args=training_args,
             data_args=data_args,
         )
-        data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer)
-        return dict(
-            train_dataset=train_dataset,
-            eval_dataset=None,
-            data_collator=data_collator,
-        )
-    elif "strategy" in data_args.data_name:
+        return train_dataset
+    elif "strategy" in data_name:
         dataset = load_dataset("zen-E/StrategyQA_CoT_GPT4o")["train"]
         train_dataset = SupervisedDataset(
-            data_name=data_args.data_name,
+            data_name=data_name,
             raw_data=dataset,
             tokenizer=tokenizer,
             bot=model.bot_id,
@@ -432,16 +468,11 @@ def make_supervised_data_module(tokenizer, data_args, model, training_args) -> D
             training_args=training_args,
             data_args=data_args,
         )
-        data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer)
-        return dict(
-            train_dataset=train_dataset,
-            eval_dataset=None,
-            data_collator=data_collator,
-        )
-    elif "commonsense" in data_args.data_name:
+        return train_dataset
+    elif "commonsense" in data_name:
         dataset = load_dataset("zen-E/CommonsenseQA-GPT4omini")["train"]
         train_dataset = SupervisedDataset(
-            data_name=data_args.data_name,
+            data_name=data_name,
             raw_data=dataset,
             tokenizer=tokenizer,
             bot=model.bot_id,
@@ -449,17 +480,12 @@ def make_supervised_data_module(tokenizer, data_args, model, training_args) -> D
             training_args=training_args,
             data_args=data_args,
         )
-        data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer)
-        return dict(
-            train_dataset=train_dataset,
-            eval_dataset=None,
-            data_collator=data_collator,
-        )
-    elif "prontoqa" in data_args.data_name:
+        return train_dataset
+    elif "prontoqa" in data_name:
         with open("/home/ubuntu/coconut/data/prontoqa_train.json") as f:
             dataset = json.load(f)
         train_dataset = SupervisedDataset(
-            data_name=data_args.data_name,
+            data_name=data_name,
             raw_data=dataset,
             tokenizer=tokenizer,
             bot=model.bot_id,
@@ -467,11 +493,32 @@ def make_supervised_data_module(tokenizer, data_args, model, training_args) -> D
             training_args=training_args,
             data_args=data_args,
         )
-        data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer)
-        return dict(
-            train_dataset=train_dataset,
-            eval_dataset=None,
-            data_collator=data_collator,
-        )
+        return train_dataset
     else:
-        raise NotImplementedError(f"Dataset {data_args.data_name} is not supported.")
+        raise NotImplementedError(f"Dataset {data_name} is not supported.")
+
+
+def make_supervised_data_module(tokenizer, data_args, model, training_args) -> Dict:
+    """Make dataset and collator for supervised fine-tuning."""
+    logging.warning("Downloading Data")
+
+    # Load datasets from the list
+    if not data_args.data_names:
+        raise ValueError("data_names must be a non-empty list of dataset names")
+
+    datasets = []
+    for data_name in data_args.data_names:
+        dataset = load_single_dataset(
+            data_name, tokenizer, model, training_args, data_args
+        )
+        datasets.append(dataset)
+
+    # Concatenate all datasets
+    train_dataset = concatenate_datasets(datasets)
+
+    data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer)
+    return dict(
+        train_dataset=train_dataset,
+        eval_dataset=None,
+        data_collator=data_collator,
+    )

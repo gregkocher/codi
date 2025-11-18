@@ -10,7 +10,10 @@ model_args:
 
 # Data Arguments
 data_args:
-  data_name: "icot"
+  data_names:
+    - "icot"
+    - "strategy"
+    - "commonsense"
   max_samples: null
 
 # Wandb Arguments
