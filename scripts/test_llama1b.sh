@@ -17,4 +17,4 @@ python test.py \
 	--inf_num_iterations 1 \
 	--remove_eos True \
 	--use_lora True \
-	--ckpt_dir /workspace/projects/codi/models/codi_llama1b_orig
+	--ckpt_dir bcywinski/codi_llama1b_gsm8k-strategyqa-commonsense

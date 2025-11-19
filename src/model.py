@@ -20,9 +20,6 @@ class ModelArguments:
     full_precision: bool = field(
         default=True, metadata={"help": "whether use int4 for the base model"}
     )
-    attn_implementation: str = field(
-        default="eager", metadata={"help": "attention implementation"}
-    )
     train: bool = field(
         default=True,
         metadata={
@@ -202,7 +199,6 @@ class CODI(torch.nn.Module):
         prj_no_ln: bool = False,
         remove_eos: bool = False,
         model_max_length: int = 28000,
-        attn_implementation: str = "flash_attention_2",
         full_precision: bool = True,
         device: str = "cuda",
         dtype: str = "bfloat16",
@@ -230,7 +226,6 @@ class CODI(torch.nn.Module):
             prj_no_ln: Remove LayerNorm from projection module
             remove_eos: Do not add <eos> as delimiter
             model_max_length: Maximum sequence length
-            attn_implementation: Attention implementation ("flash_attention_2", "eager", etc.)
             full_precision: Use full precision (bf16/fp16) vs quantized (4-bit)
             device: Device to load model on ("cuda" or "cpu")
             dtype: Data type ("bfloat16" or "float16")
@@ -260,7 +255,6 @@ class CODI(torch.nn.Module):
             lora_alpha=lora_alpha,
             lora_init=True,
             full_precision=full_precision,
-            attn_implementation=attn_implementation,
             train=False,  # Inference mode
             token=token,
         )
@@ -396,7 +390,6 @@ class CODI(torch.nn.Module):
                     torch.float16 if training_args.bf16 is False else torch.bfloat16
                 ),
                 resume_download=True,
-                # attn_implementation=model_args.attn_implementation,
             )
         else:
             self.codi = model_wrapper_class.from_pretrained(
@@ -411,7 +404,6 @@ class CODI(torch.nn.Module):
                     bnb_4bit_use_double_quant=False,
                     bnb_4bit_quant_type="nf4",
                 ),
-                # attn_implementation=model_args.attn_implementation,
             )
 
         ori_vocab_size = self.codi.config.vocab_size

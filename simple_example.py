@@ -22,7 +22,6 @@ model = CODI.from_pretrained(
     device="cuda",
     dtype="bfloat16",
     strict=False,
-    attn_implementation="eager",
     # Optional: specify where to save the checkpoint (default: ./checkpoints/{name})
     checkpoint_save_path="./models/codi_gpt2",
 )

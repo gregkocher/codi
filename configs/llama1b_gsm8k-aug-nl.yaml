@@ -6,7 +6,6 @@ model_args:
   lora_init: true
   token: null
   full_precision: true
-  attn_implementation: "eager"
 
 # Data Arguments
 data_args:

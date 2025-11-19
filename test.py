@@ -53,7 +53,6 @@ def evaluation(model_args, data_args, training_args):
         use_prj=training_args.use_prj,
         remove_eos=training_args.remove_eos,
         model_max_length=training_args.model_max_length,
-        attn_implementation=model_args.attn_implementation,
         full_precision=model_args.full_precision,
         device="cuda",
         dtype="bfloat16" if training_args.bf16 else "float16",
