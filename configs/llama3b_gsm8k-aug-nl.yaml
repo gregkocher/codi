@@ -6,7 +6,6 @@ model_args:
   lora_init: true
   token: null
   full_precision: true
-  attn_implementation: "flash_attention_2"
 
 # Data Arguments
 data_args:
