@@ -70,7 +70,7 @@ class CustomTrainer(Trainer):
                     "ce_loss": outputs["ce_loss"],
                     "distill_loss": outputs["distill_loss"],
                     "ref_ce_loss": outputs["ref_ce_loss"],
-                    "sft_loss": outputs["sft_loss"],
+                    "ans_ce_loss": outputs["ans_ce_loss"],
                 }
             )
         return loss

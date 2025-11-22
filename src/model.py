@@ -140,6 +140,9 @@ class TrainingArguments(transformers.TrainingArguments):
     ref_loss_factor: float = field(
         default=1.0, metadata={"help": "A multiplier of the distillation loss."}
     )
+    sft_loss_factor: float = field(
+        default=1.0, metadata={"help": "A multiplier of the SFT loss."}
+    )
     inf_latent_iterations: int = field(default=1, metadata={"help": ""})
     inf_num_iterations: int = field(
         default=5, metadata={"help": "Run multiple times during inference"}
@@ -300,7 +303,11 @@ class CODI(torch.nn.Module):
         )
 
         # Initialize model
-        model = cls(model_args, training_args, lora_config)
+
+        tokenizer = transformers.AutoTokenizer.from_pretrained(
+            checkpoint_path, trust_remote_code=True
+        )
+        model = cls(model_args, training_args, lora_config, tokenizer)
 
         # Step 2: Handle checkpoint (checkpoint_path)
         # Check if checkpoint_path is a HuggingFace ID or local path
@@ -439,6 +446,7 @@ class CODI(torch.nn.Module):
         # Losses
         self.print_loss = training_args.print_loss
         self.ref_loss_factor = training_args.ref_loss_factor
+        self.sft_loss_factor = training_args.sft_loss_factor
 
         # Cross Entropy Loss
         self.loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
@@ -525,6 +533,29 @@ class CODI(torch.nn.Module):
             ref_attention_mask = None
 
         # --- Standard pipeline as before ---
+        # first direct answer sft ce loss
+        direct_ans_input = torch.cat([encoder_input_ids_ans, decoder_input_ids], dim=1)
+        direct_ans_targets = torch.cat(
+            [
+                torch.ones(
+                    encoder_input_ids_ans.shape[0], encoder_input_ids_ans.shape[1] + 1
+                ).to(encoder_input_ids_ans.device)
+                * -100,
+                labels[:, 1:],
+            ],
+            dim=1,
+        )
+        ans_outputs = self.codi(
+            input_ids=direct_ans_input,
+            use_cache=True,
+            output_hidden_states=True,
+        )
+        ans_logits = ans_outputs.logits
+        # effective_ans_logits = ans_logits[:, :-1, :]
+        effective_ans_logits = ans_logits.reshape(-1, ans_logits.size(-1))
+        ans_targets = direct_ans_targets.reshape(-1).long()
+        ans_ce_loss = self.loss_fct(effective_ans_logits, ans_targets)
+        ans_ce_loss *= self.sft_loss_factor
 
         # Encode the question
         past_key_values = None
@@ -688,64 +719,17 @@ class CODI(torch.nn.Module):
         ref_ce_loss = self.loss_fct(effective_ref_logits, ref_target_ids)
         ref_ce_loss *= self.ref_loss_factor
 
-        # ---- SFT loss: model, input is encoder_input_ids_ans + first token of decoder_input_ids, predict the rest ----
-
-        sft_loss = 0.0
-        sft_logits = None
-
-        if (
-            encoder_input_ids_ans is not None
-            and decoder_input_ids is not None
-            and decoder_input_ids.size(1) > 1
-        ):
-            # SFT input: concatenate encoder_input_ids_ans and first decoder token for each sample in batch
-            batch_size = encoder_input_ids_ans.size(0)
-            first_token = decoder_input_ids[:, :1]  # (batch, 1)
-            sft_input_ids = torch.cat(
-                [encoder_input_ids_ans, first_token], dim=1
-            )  # (batch, seq+1)
-
-            # Target: decoder_input_ids[:, 1:]
-            sft_targets = decoder_input_ids[:, 1:]  # (batch, tgt_len)
-            # Mask: for correct loss, will shift sft_logits for ce loss
-
-            # Forward through the model
-            sft_outputs = self.codi(
-                input_ids=sft_input_ids,
-                use_cache=True,
-                output_hidden_states=False,
-                attention_mask=None,  # could add mask if needed
-            )
-            sft_logits = sft_outputs.logits  # (batch, sft_len, vocab)
-            # Only compute loss on the decoder portion
-            # sft_logits for the prediction positions, to predict decoder tokens 1 onwards
-            # Input: [enc ...][<BOS>]; Targets are: <T1> <T2> ... <Tn>
-            # So align sft_logits[:, -tgt_len-1:-1] with sft_targets for loss
-
-            pred_start = sft_logits.size(1) - sft_targets.size(1)
-            sft_pred_logits = sft_logits[
-                :, pred_start:-1, :
-            ]  # skip the last (for alignment)
-            sft_pred_logits = sft_pred_logits.reshape(-1, sft_pred_logits.size(-1))
-            sft_targets_flat = sft_targets[:, :-1].reshape(
-                -1
-            )  # to match sft_pred_logits shape
-
-            sft_loss = self.loss_fct(sft_pred_logits, sft_targets_flat)
-
-        # ----
-
         # Weigh the distillation loss
         distill_loss *= self.distill_loss_factor
         distill_loss_total *= self.distill_loss_factor
 
         if self.print_loss:
             print(
-                f"loss={ce_loss + distill_loss}, ce_loss={ce_loss}, distill_loss={distill_loss}, ce_loss_total={ce_loss_total}, distill_loss_total={distill_loss_total}, ref_ce_loss={ref_ce_loss}, sft_loss={sft_loss}"
+                f"loss={ce_loss + distill_loss}, ce_loss={ce_loss}, distill_loss={distill_loss}, ce_loss_total={ce_loss_total}, distill_loss_total={distill_loss_total}, ref_ce_loss={ref_ce_loss}, sft_loss={ans_ce_loss}"
             )
 
-        # Add the new SFT loss to the overall loss
-        loss = ce_loss_total + distill_loss_total + ref_ce_loss + sft_loss
+        # Add the new ans ce loss to the overall loss
+        loss = ce_loss_total + distill_loss_total + ref_ce_loss + ans_ce_loss
 
         if ce_loss_total != 0:
             ce_loss_total = ce_loss_total.detach().item()
@@ -753,8 +737,8 @@ class CODI(torch.nn.Module):
             distill_loss_total = distill_loss_total.detach().item()
         if ref_ce_loss != 0:
             ref_ce_loss = ref_ce_loss.detach().item()
-        if sft_loss != 0:
-            sft_loss = sft_loss.detach().item()
+        if ans_ce_loss != 0:
+            ans_ce_loss = ans_ce_loss.detach().item()
 
         return {
             "loss": loss,
@@ -762,7 +746,7 @@ class CODI(torch.nn.Module):
             "ce_loss": ce_loss_total,
             "distill_loss": distill_loss_total,
             "ref_ce_loss": ref_ce_loss,
-            "sft_loss": sft_loss,
+            "ans_ce_loss": ans_ce_loss,
         }
 
     def generate(
@@ -781,6 +765,7 @@ class CODI(torch.nn.Module):
         output_attentions: bool = False,
         output_hidden_states: bool = False,
         skip_thinking: bool = False,
+        sot_token: int = None,
     ):
         """
         Generate text with latent reasoning steps.
@@ -800,6 +785,7 @@ class CODI(torch.nn.Module):
             output_attentions: Whether to return attention weights for each generation step
             output_hidden_states: Whether to return hidden states computed on the prompt until thinking
             skip_thinking: Whether to skip the thinking/latent reasoning phase
+            sot_token: Whether to use the sot token for the generation
         Returns:
             dict with keys:
                 - 'sequences': Generated token IDs of shape (batch_size, generated_length)
@@ -851,11 +837,11 @@ class CODI(torch.nn.Module):
                 # Step 3: Now add <bot> (with or without extra eos)
                 if remove_eos:
                     bot_tensor = torch.tensor(
-                        [self.bot_id], dtype=torch.long, device=device
+                        [sot_token], dtype=torch.long, device=device
                     ).expand(batch_size, 1)
                 else:
                     bot_tensor = torch.tensor(
-                        [tokenizer.eos_token_id, self.bot_id],
+                        [tokenizer.eos_token_id, sot_token],
                         dtype=torch.long,
                         device=device,
                     ).expand(batch_size, 2)
@@ -901,6 +887,7 @@ class CODI(torch.nn.Module):
 
                 # Latent reasoning iterations
                 for i in range(num_latent_iterations):
+                    print(f"Latent reasoning iteration {i + 1}")
                     outputs = self.codi(
                         inputs_embeds=latent_embd,
                         use_cache=True,
@@ -921,9 +908,14 @@ class CODI(torch.nn.Module):
 
             # Add EOT token embeddings
             if remove_eos:
+                print("Generating EOT token embeddings")
                 eot_emb = (
                     self.get_embd(self.codi, self.model_name)(
-                        torch.tensor([self.eot_id], dtype=torch.long, device=device)
+                        torch.tensor(
+                            [tokenizer.convert_tokens_to_ids("<|eocot|>")],
+                            dtype=torch.long,
+                            device=device,
+                        )
                     )
                     .unsqueeze(0)
                     .to(device)
@@ -932,7 +924,10 @@ class CODI(torch.nn.Module):
                 eot_emb = (
                     self.get_embd(self.codi, self.model_name)(
                         torch.tensor(
-                            [self.eot_id, tokenizer.eos_token_id],
+                            [
+                                tokenizer.convert_tokens_to_ids("<|eocot|>"),
+                                tokenizer.eos_token_id,
+                            ],
                             dtype=torch.long,
                             device=device,
                         )
