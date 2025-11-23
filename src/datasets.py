@@ -163,17 +163,17 @@ def preprocess(
     #     answer_prompts[0] = answer_prompts[0][1:]
     #     answer_prompts[1] = answer_prompts[1][1:]
 
-    answer_prompts = [
-        torch.tensor(tokenizer.encode("Answer: ", add_special_tokens=False))
-    ]
-    # ref_answer_position = [len(y) for y in sources_id_vcot]
-    ref_answer_position = [
-        get_answer_token_position(x, answer_prompts, tokenizer) for x in ref_input_ids
-    ]
-    model_answer_position = [
-        get_answer_token_position(x, answer_prompts, tokenizer) for x in answers_id
-    ]
-    # model_answer_position = [0] * len(answers_id)
+    # answer_prompts = [
+    #     torch.tensor(tokenizer.encode("Answer: ", add_special_tokens=False))
+    # ]
+    ref_answer_position = [len(y) - len(a) for y, a in zip(ref_input_ids, answers_id)]
+    # ref_answer_position = [
+    #     get_answer_token_position(x, answer_prompts, tokenizer) for x in ref_input_ids
+    # ]
+    # model_answer_position = [
+    #     get_answer_token_position(x, answer_prompts, tokenizer) for x in answers_id
+    # ]
+    model_answer_position = [0] * len(answers_id)
 
     encoder_input_ids_ans = [
         torch.cat([src, ans], dim=0) for src, ans in zip(sources_id_ans, answers_id)
@@ -269,7 +269,7 @@ class SupervisedDataset(Dataset):
                 answer = example["answer"].split(" ")[-1]
                 if not answer[0].isdigit():
                     continue
-                answer = f"Answer: {answer}"
+                answer = f"{answer}"
                 answer = answer.replace("####", "")
                 questions.append(question)
 

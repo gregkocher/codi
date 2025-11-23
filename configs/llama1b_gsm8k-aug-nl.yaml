@@ -18,7 +18,7 @@ data_args:
 # Wandb Arguments
 wandb:
   project: "codi"
-  run_name: "codi_llama1b_gsm8k-aug-nl-direct-ans-test3"
+  run_name: "codi_llama1b_gsm8k-answer-empty"
 
 # Hub Arguments
 hub:
@@ -28,9 +28,9 @@ hub:
 
 # Training Arguments
 training_args:
-  output_dir: "./models/codi_llama1b_gsm8k-aug-nl-direct-ans-test3"
-  expt_name: "codi_llama1b_gsm8k-aug-nl-direct-ans-test3"
-  logging_dir: "./models/codi_llama1b_gsm8k-aug-nl-direct-ans-test3/logs"
+  output_dir: "./models/codi_llama1b_gsm8k-answer-empty"
+  expt_name: "codi_llama1b_gsm8k-answer-empty"
+  logging_dir: "./models/codi_llama1b_gsm8k-answer-empty/logs"
   logging_steps: 10
   seed: 11
   model_max_length: 512
@@ -38,7 +38,7 @@ training_args:
   gradient_accumulation_steps: 1
   bf16: true
   max_steps: -1
-  num_train_epochs: 10
+  num_train_epochs: 1
   learning_rate: 8e-4
   max_grad_norm: 2.0
   save_strategy: "epoch"
@@ -67,3 +67,4 @@ training_args:
   ddp_find_unused_parameters: false
   sft_loss_factor: 1.0
   include_last_cot: true
+  ce_loss_factor: 1.0
