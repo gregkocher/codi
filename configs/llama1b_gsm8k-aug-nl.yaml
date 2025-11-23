@@ -18,7 +18,7 @@ data_args:
 # Wandb Arguments
 wandb:
   project: "codi"
-  run_name: "codi_llama1b_gsm8k-answer-empty"
+  run_name: "codi_llama1b_gsm8k-the-answer-is"
 
 # Hub Arguments
 hub:
@@ -28,9 +28,9 @@ hub:
 
 # Training Arguments
 training_args:
-  output_dir: "./models/codi_llama1b_gsm8k-answer-empty"
-  expt_name: "codi_llama1b_gsm8k-answer-empty"
-  logging_dir: "./models/codi_llama1b_gsm8k-answer-empty/logs"
+  output_dir: "./models/codi_llama1b_gsm8k-the-answer-is"
+  expt_name: "codi_llama1b_gsm8k-the-answer-is"
+  logging_dir: "./models/codi_llama1b_gsm8k-the-answer-is/logs"
   logging_steps: 10
   seed: 11
   model_max_length: 512
@@ -66,5 +66,5 @@ training_args:
   dataloader_num_workers: 4
   ddp_find_unused_parameters: false
   sft_loss_factor: 1.0
-  include_last_cot: true
+  include_last_cot: false
   ce_loss_factor: 1.0

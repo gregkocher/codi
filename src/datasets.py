@@ -116,16 +116,22 @@ def preprocess(
         cot_id = [x[1:] for x in cot_id]
         answers_id = [x[1:] for x in answers_id]
 
+    ref_input_ids = [
+        torch.cat([x, y, z]).to(torch.long)
+        for x, y, z in zip(sources_id, cot_id, answers_id)
+    ]
+    ref_labels = []
+    for x, y in zip(ref_input_ids, sources_id):
+        z = x.clone()
+        z[: len(y)] = -100
+        ref_labels.append(z)
+
     # add eot to source
     sources_id_ans = [
         torch.tensor(x.numpy().tolist() + [tokenizer.ans_id], dtype=torch.long)
         for x in sources_id
     ]
     sources_id_lcot = [
-        torch.tensor(x.numpy().tolist() + [tokenizer.bot_id], dtype=torch.long)
-        for x in sources_id
-    ]
-    sources_id_vcot = [
         torch.tensor(x.numpy().tolist() + [tokenizer.bot_id], dtype=torch.long)
         for x in sources_id
     ]
@@ -145,16 +151,6 @@ def preprocess(
             for x in answers_id
         ]
 
-    ref_input_ids = [
-        torch.cat([x, y, z]).to(torch.long)
-        for x, y, z in zip(sources_id_vcot, cot_id, answers_id)
-    ]
-    ref_labels = []
-    for x, y in zip(ref_input_ids, sources_id_vcot):
-        z = x.clone()
-        z[: len(y)] = -100
-        ref_labels.append(z)
-
     # answer_prompts = [
     #     torch.tensor(tokenizer.encode("")),
     #     # torch.tensor(tokenizer.encode("The next step result is:")),
@@ -163,17 +159,19 @@ def preprocess(
     #     answer_prompts[0] = answer_prompts[0][1:]
     #     answer_prompts[1] = answer_prompts[1][1:]
 
-    # answer_prompts = [
-    #     torch.tensor(tokenizer.encode("Answer: ", add_special_tokens=False))
-    # ]
-    ref_answer_position = [len(y) - len(a) for y, a in zip(ref_input_ids, answers_id)]
-    # ref_answer_position = [
-    #     get_answer_token_position(x, answer_prompts, tokenizer) for x in ref_input_ids
-    # ]
-    # model_answer_position = [
-    #     get_answer_token_position(x, answer_prompts, tokenizer) for x in answers_id
-    # ]
-    model_answer_position = [0] * len(answers_id)
+    answer_prompts = [
+        torch.tensor(tokenizer.encode("The answer is:", add_special_tokens=False))
+    ]
+    ref_answer_position = [
+        get_answer_token_position(x, answer_prompts, tokenizer) for x in ref_input_ids
+    ]
+    model_answer_position = [
+        get_answer_token_position(x, answer_prompts, tokenizer) for x in answers_id
+    ]
+
+    ### answer only
+    # ref_answer_position = [len(y) - len(a) for y, a in zip(ref_input_ids, answers_id)]
+    # model_answer_position = [0] * len(answers_id)
 
     encoder_input_ids_ans = [
         torch.cat([src, ans], dim=0) for src, ans in zip(sources_id_ans, answers_id)
@@ -269,7 +267,7 @@ class SupervisedDataset(Dataset):
                 answer = example["answer"].split(" ")[-1]
                 if not answer[0].isdigit():
                     continue
-                answer = f"{answer}"
+                answer = f"The answer is: {answer}"
                 answer = answer.replace("####", "")
                 questions.append(question)
 
