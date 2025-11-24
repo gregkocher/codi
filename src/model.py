@@ -757,6 +757,7 @@ class CODI(torch.nn.Module):
         skip_thinking: bool = False,
         sot_token: int = None,
         verbalize_cot: bool = False,
+        eot_token: int = None,
     ):
         """
         Generate text with latent reasoning steps.
@@ -787,6 +788,9 @@ class CODI(torch.nn.Module):
                 - 'hidden_states': Hidden states computed on the prompt until thinking if output_hidden_states=True
                   A tuple of tensors, one per layer, each of shape (batch_size, seq_len, hidden_dim)
         """
+        assert not (verbalize_cot and skip_thinking), (
+            "verbalize_cot and skip_thinking cannot be True at the same time"
+        )
         if tokenizer is None:
             tokenizer = self.tokenizer
 
@@ -799,70 +803,32 @@ class CODI(torch.nn.Module):
 
         past_key_values = None
         prompt_hidden_states = None
-
-        if verbalize_cot:
-            # just use generate from transformers
-            print(tokenizer.convert_ids_to_tokens(input_ids[0]))
-            outputs = self.codi.generate(
-                input_ids=input_ids,
-                max_new_tokens=max_new_tokens,
-                temperature=temperature,
-                top_k=top_k,
-                top_p=top_p,
-                attention_mask=attention_mask,
-                pad_token_id=tokenizer.pad_token_id,
-            )
-            # Calculate the number of prompt tokens for each item in the batch
-            prompt_lengths = [input_ids[i].size(0) for i in range(input_ids.size(0))]
-            # Remove the prompt tokens from each generated output
-            sequences = []
-            for i, prompt_len in enumerate(prompt_lengths):
-                sequences.append(outputs[i, prompt_len:])
-            # Pad to the maximum generation length in batch if needed
-            max_gen_len = max(seq.size(0) for seq in sequences)
-            padded_sequences = torch.full(
-                (len(sequences), max_gen_len),
-                tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0,
-                dtype=outputs.dtype,
-                device=outputs.device,
-            )
-            for i, seq in enumerate(sequences):
-                padded_sequences[i, : seq.size(0)] = seq
-            return {"sequences": padded_sequences}
-
         if remove_eos:
             bot_tensor = torch.tensor(
                 [sot_token], dtype=torch.long, device=device
             ).expand(batch_size, 1)
         else:
-            bot_tensor = torch.tensor(
-                [tokenizer.eos_token_id, sot_token],
-                dtype=torch.long,
-                device=device,
-            ).expand(batch_size, 2)
+            if skip_thinking:
+                bot_tensor = torch.tensor(
+                    [tokenizer.eos_token_id, eot_token],
+                    dtype=torch.long,
+                    device=device,
+                ).expand(batch_size, 2)
+            else:
+                bot_tensor = torch.tensor(
+                    [tokenizer.eos_token_id, sot_token],
+                    dtype=torch.long,
+                    device=device,
+                ).expand(batch_size, 2)
 
         input_ids_bot = torch.cat((input_ids, bot_tensor), dim=1)
         attention_mask_bot = torch.cat(
             (attention_mask, torch.ones_like(bot_tensor, device=device)), dim=1
         )
+        print(tokenizer.convert_ids_to_tokens(input_ids_bot[0]))
 
-        if skip_thinking:
+        if verbalize_cot or skip_thinking:
             # just use generate from transformers
-            eot_tensor = torch.tensor(
-                [tokenizer.encode("<|eocot|>", add_special_tokens=False)[0]],
-                dtype=torch.long,
-                device=device,
-            ).expand(batch_size, 1)
-            input_ids_bot = torch.cat((input_ids, bot_tensor, eot_tensor), dim=1)
-            attention_mask_bot = torch.cat(
-                (
-                    attention_mask,
-                    torch.ones_like(bot_tensor, device=device),
-                    torch.ones_like(eot_tensor, device=device),
-                ),
-                dim=1,
-            )
-            print(tokenizer.convert_ids_to_tokens(input_ids_bot[0]))
             outputs = self.codi.generate(
                 input_ids=input_ids_bot,
                 max_new_tokens=max_new_tokens,

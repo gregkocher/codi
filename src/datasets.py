@@ -131,8 +131,14 @@ def preprocess(
     #     for x in sources_id
     # ]
 
-    sources_id_cot = [
-        torch.tensor(x.numpy().tolist() + [tokenizer.bot_id], dtype=torch.long)
+    sources_id_latent = [
+        torch.tensor(x.numpy().tolist() + [tokenizer.latent_think_id], dtype=torch.long)
+        for x in sources_id
+    ]
+    sources_id_verbalized = [
+        torch.tensor(
+            x.numpy().tolist() + [tokenizer.verbalized_think_id], dtype=torch.long
+        )
         for x in sources_id
     ]
     # add eot and eos
@@ -152,10 +158,10 @@ def preprocess(
 
     ref_input_ids = [
         torch.cat([x, y, z]).to(torch.long)
-        for x, y, z in zip(sources_id_cot, cot_id, answers_id)
+        for x, y, z in zip(sources_id_verbalized, cot_id, answers_id)
     ]
     ref_labels = []
-    for x, y in zip(ref_input_ids, sources_id_cot):
+    for x, y in zip(ref_input_ids, sources_id_verbalized):
         z = x.clone()
         z[: len(y)] = -100
         ref_labels.append(z)
@@ -210,7 +216,7 @@ def preprocess(
     return dict(
         # encoder_input_ids=sources_id,
         encoder_input_ids_ans=encoder_input_ids_ans,
-        encoder_input_ids_lcot=sources_id_cot,
+        encoder_input_ids_lcot=sources_id_latent,
         # encoder_input_ids_vcot=sources_id_vcot,
         decoder_input_ids=answers_id,
         ref_input_ids=ref_input_ids,
