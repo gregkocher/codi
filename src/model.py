@@ -419,7 +419,7 @@ class CODI(torch.nn.Module):
         self.tokenizer = tokenizer
 
         # special tokens to enclose the latent embeddings
-        self.codi.resize_token_embeddings(len(tokenizer))
+        self.codi.resize_token_embeddings(len(tokenizer), mean_resizing=False)
         # self.pad_token_id = ori_vocab_size
         # self.bot_id = ori_vocab_size + 1
         # self.eot_id = ori_vocab_size + 2
@@ -685,7 +685,7 @@ class CODI(torch.nn.Module):
         ce_loss_total *= self.ce_loss_factor
         if self.print_loss:
             print(
-                f"loss={ce_loss + distill_loss}, ce_loss={ce_loss}, distill_loss={distill_loss}, ce_loss_total={ce_loss_total}, distill_loss_total={distill_loss_total}, ref_ce_loss={ref_ce_loss}, sft_loss={ans_ce_loss}"
+                f"loss={ce_loss + distill_loss}, ce_loss={ce_loss}, distill_loss={distill_loss}, ce_loss_total={ce_loss_total}, distill_loss_total={distill_loss_total}, ref_ce_loss={ref_ce_loss}, ans_ce_loss={ans_ce_loss}"
             )
         # Add the new ans ce loss to the overall loss
         loss = ce_loss_total + distill_loss_total + ref_ce_loss + ans_ce_loss
@@ -873,37 +873,21 @@ class CODI(torch.nn.Module):
                         dtype=self.codi.dtype
                     )  # FIX: layer norm casts to fp32
 
-                # Add EOT token embeddings
-                if remove_eos:
-                    eot_emb = (
-                        self.get_embd(self.codi, self.model_name)(
-                            torch.tensor(
-                                [tokenizer.convert_tokens_to_ids("<|eocot|>")],
-                                dtype=torch.long,
-                                device=device,
-                            )
-                        )
-                        .unsqueeze(0)
-                        .to(device)
-                    )
-                else:
-                    eot_emb = (
-                        self.get_embd(self.codi, self.model_name)(
-                            torch.tensor(
-                                [
-                                    tokenizer.convert_tokens_to_ids("<|eocot|>"),
-                                    tokenizer.eos_token_id,
-                                ],
-                                dtype=torch.long,
-                                device=device,
-                            )
-                        )
-                        .unsqueeze(0)
-                        .to(device)
-                    )
+            # Add EOT token embeddings
+            last_ids = torch.tensor(
+                [tokenizer.convert_tokens_to_ids("<|eocot|>")],
+                dtype=torch.long,
+                device=device,
+            )
+            print(tokenizer.convert_ids_to_tokens(last_ids))
 
-                eot_emb = eot_emb.expand(batch_size, -1, -1)
-                output_emb = eot_emb
+            eot_emb = (
+                self.get_embd(self.codi, self.model_name)(last_ids)
+                .unsqueeze(0)
+                .to(device)
+            )
+            eot_emb = eot_emb.expand(batch_size, -1, -1)
+            output_emb = eot_emb
 
             # Generate tokens
             finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
