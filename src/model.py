@@ -567,7 +567,6 @@ class CODI(torch.nn.Module):
                 dtype=self.codi.dtype
             )  # FIX: layer norm casts to fp32
 
-        len_pred_loss = 0
         dynamic_mask = None
         if self.fix_attn_mask:
             dynamic_mask = torch.ones(
@@ -741,7 +740,7 @@ class CODI(torch.nn.Module):
             return_latent_vectors: Whether to return latent reasoning vectors
             remove_eos: Whether to remove EOS token when adding BOT/EOT tokens
             output_attentions: Whether to return attention weights for each generation step
-            output_hidden_states: Whether to return hidden states computed on the prompt until thinking
+            output_hidden_states: Whether to return hidden states computed on ALL positions (prompt + latent + generated)
             skip_thinking: Whether to skip the thinking/latent reasoning phase
             sot_token: Whether to use the sot token for the generation
         Returns:
@@ -751,8 +750,10 @@ class CODI(torch.nn.Module):
                   Each element is a tensor of shape (batch_size, 1, hidden_dim)
                 - 'attentions': List of attention tensors for each generation step if output_attentions=True
                   Each element is a tuple of tensors, one per layer
-                - 'hidden_states': Hidden states computed on the prompt until thinking if output_hidden_states=True
-                  A tuple of tensors, one per layer, each of shape (batch_size, seq_len, hidden_dim)
+                - 'hidden_states': Hidden states for all layers on all positions.
+                    If batch_size == 1: (sequence_length, num_layers, hidden_dim)
+                    Else: (batch_size, sequence_length, num_layers, hidden_dim)
+                    If output_hidden_states=True
         """
         assert not (verbalize_cot and skip_thinking), (
             "verbalize_cot and skip_thinking cannot be True at the same time"
@@ -768,7 +769,7 @@ class CODI(torch.nn.Module):
             attention_mask = torch.ones_like(input_ids)
 
         past_key_values = None
-        prompt_hidden_states = None
+
         if remove_eos:
             bot_tensor = torch.tensor(
                 [sot_token], dtype=torch.long, device=device
@@ -794,7 +795,6 @@ class CODI(torch.nn.Module):
 
         if verbalize_cot or skip_thinking:
             # just use generate from transformers
-            print(tokenizer.convert_ids_to_tokens(input_ids_bot[0]))
 
             outputs = self.codi.generate(
                 input_ids=input_ids_bot,
@@ -826,25 +826,50 @@ class CODI(torch.nn.Module):
             return {"sequences": padded_sequences}
 
         past_key_values = None
+        hidden_state_chunks = None
+
         with torch.no_grad():
-            print(tokenizer.convert_ids_to_tokens(input_ids_bot[0]))
             outputs = self.codi(
                 input_ids=input_ids_bot,
                 use_cache=True,
-                output_hidden_states=output_hidden_states,
+                output_hidden_states=True,
                 past_key_values=past_key_values,
                 attention_mask=attention_mask_bot,
             )
             past_key_values = outputs.past_key_values
-            prompt_hidden_states = outputs.hidden_states
-            # Hidden state after <bot>
+
+            if (
+                output_hidden_states
+                and hasattr(outputs, "hidden_states")
+                and outputs.hidden_states is not None
+            ):
+                prompt_hidden_states = outputs.hidden_states
+                # Some model implementations only return last-position hidden states when caching.
+                # Ensure we have hidden states for all prompt positions.
+                if prompt_hidden_states[0].shape[1] != input_ids_bot.shape[1]:
+                    prompt_out = self.codi(
+                        input_ids=input_ids_bot,
+                        use_cache=False,
+                        output_hidden_states=True,
+                        attention_mask=attention_mask_bot,
+                    )
+                    if (
+                        hasattr(prompt_out, "hidden_states")
+                        and prompt_out.hidden_states is not None
+                    ):
+                        prompt_hidden_states = prompt_out.hidden_states
+
+                # Each element (layer): (batch, seq_len, hidden_dim)
+                hidden_state_chunks = [[h] for h in prompt_hidden_states]
+
             latent_embd = outputs.hidden_states[-1][:, -1, :].unsqueeze(1)
 
             latent_vectors = []
+            latent_vectors_pre_prj = []
             attentions_list = [] if output_attentions else None
 
             if return_latent_vectors:
-                latent_vectors.append(latent_embd.clone())
+                latent_vectors_pre_prj.append(latent_embd.clone())
 
             # Optionally project latent_embd if using prj
             if self.use_prj:
@@ -853,9 +878,11 @@ class CODI(torch.nn.Module):
                     dtype=self.codi.dtype
                 )  # FIX: layer norm casts to fp32
 
-            # Latent reasoning iterations
-            for i in range(num_latent_iterations):
-                print(f"Latent reasoning iteration {i + 1}")
+            if return_latent_vectors:
+                latent_vectors.append(latent_embd.clone())
+
+            # Latent iterations: collect hidden states
+            for _ in range(num_latent_iterations):
                 outputs = self.codi(
                     inputs_embeds=latent_embd,
                     use_cache=True,
@@ -866,7 +893,7 @@ class CODI(torch.nn.Module):
                 latent_embd = outputs.hidden_states[-1][:, -1, :].unsqueeze(1)
 
                 if return_latent_vectors:
-                    latent_vectors.append(latent_embd.clone())
+                    latent_vectors_pre_prj.append(latent_embd.clone())
 
                 if self.use_prj:
                     latent_embd = self.prj(latent_embd)
@@ -874,14 +901,24 @@ class CODI(torch.nn.Module):
                         dtype=self.codi.dtype
                     )  # FIX: layer norm casts to fp32
 
-            # Add EOT token embeddings
+                if return_latent_vectors:
+                    latent_vectors.append(latent_embd.clone())
+
+                if (
+                    output_hidden_states
+                    and hasattr(outputs, "hidden_states")
+                    and outputs.hidden_states is not None
+                ):
+                    # Append each latent step as a new token position (one per layer).
+                    if hidden_state_chunks is not None:
+                        for layer_idx, h in enumerate(outputs.hidden_states):
+                            hidden_state_chunks[layer_idx].append(h[:, -1:, :])
+
             last_ids = torch.tensor(
                 [tokenizer.convert_tokens_to_ids("<|eocot|>")],
                 dtype=torch.long,
                 device=device,
             )
-            print(tokenizer.convert_ids_to_tokens(last_ids))
-
             eot_emb = (
                 self.get_embd(self.codi, self.model_name)(last_ids)
                 .unsqueeze(0)
@@ -890,14 +927,13 @@ class CODI(torch.nn.Module):
             eot_emb = eot_emb.expand(batch_size, -1, -1)
             output = eot_emb
 
-            # Generate tokens
             finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
             generated_tokens = [[] for _ in range(batch_size)]
 
             for step in range(max_new_tokens):
                 out = self.codi(
                     inputs_embeds=output,
-                    output_hidden_states=False,
+                    output_hidden_states=output_hidden_states,
                     attention_mask=None,
                     use_cache=True,
                     output_attentions=output_attentions,
@@ -934,45 +970,45 @@ class CODI(torch.nn.Module):
                         cumulative_probs = torch.cumsum(
                             F.softmax(sorted_logit, dim=-1), dim=-1
                         )
-
                         sorted_indices_to_remove = cumulative_probs > top_p
                         if sorted_indices_to_remove.any():
                             sorted_indices_to_remove = sorted_indices_to_remove.roll(
                                 1, dims=-1
                             )
                             sorted_indices_to_remove[:, 0] = False
-
                         for b in range(logits.size(0)):
                             logits[
                                 b, sorted_indices[b, sorted_indices_to_remove[b]]
                             ] = -float("inf")
-
                     probs = F.softmax(logits, dim=-1)
                     next_token_ids = torch.multinomial(probs, num_samples=1).squeeze(-1)
-
-                # Ensure next_token_ids has at least 1 dimension for indexing
                 if next_token_ids.dim() == 0:
                     next_token_ids = next_token_ids.unsqueeze(0)
 
-                # Track generated tokens
                 for b in range(batch_size):
                     if not finished[b]:
                         generated_tokens[b].append(next_token_ids[b].item())
                         if next_token_ids[b] == tokenizer.eos_token_id:
                             finished[b] = True
 
-                # Break if all sequences finished
+                if (
+                    output_hidden_states
+                    and hasattr(out, "hidden_states")
+                    and out.hidden_states is not None
+                ):
+                    if hidden_state_chunks is not None:
+                        for layer_idx, h in enumerate(out.hidden_states):
+                            hidden_state_chunks[layer_idx].append(h[:, -1:, :])
+
                 if finished.all():
                     break
 
-                # Get embeddings for next iteration
                 output = (
                     self.get_embd(self.codi, self.model_name)(next_token_ids)
                     .unsqueeze(1)
                     .to(device)
                 )
 
-        # Convert generated tokens to tensor
         max_len = max(len(seq) for seq in generated_tokens)
         sequences = torch.full(
             (batch_size, max_len),
@@ -980,7 +1016,6 @@ class CODI(torch.nn.Module):
             dtype=torch.long,
             device=device,
         )
-
         for b, tokens in enumerate(generated_tokens):
             sequences[b, : len(tokens)] = torch.tensor(tokens, dtype=torch.long)
 
@@ -988,11 +1023,20 @@ class CODI(torch.nn.Module):
 
         if return_latent_vectors and not skip_thinking:
             result["latent_vectors"] = latent_vectors
+            result["latent_vectors_pre_prj"] = latent_vectors_pre_prj
 
         if output_attentions:
             result["attentions"] = attentions_list
 
-        if output_hidden_states and prompt_hidden_states is not None:
-            result["hidden_states"] = prompt_hidden_states
+        if output_hidden_states and hidden_state_chunks is not None:
+            # Return a single tensor with hidden states for all layers on all positions.
+            # Shape: (batch, seq_len, n_layers, hidden_dim). If batch==1, squeeze to
+            # (seq_len, n_layers, hidden_dim) for convenience.
+            per_layer = [torch.cat(chunks, dim=1) for chunks in hidden_state_chunks]
+            # (n_layers, batch, seq, hidden)
+            stacked = torch.stack(per_layer, dim=0)
+            # (batch, seq, n_layers, hidden)
+            stacked = stacked.permute(1, 2, 0, 3).contiguous()
+            result["hidden_states"] = stacked[0] if stacked.shape[0] == 1 else stacked
 
         return result

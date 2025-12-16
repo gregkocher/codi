@@ -11,14 +11,14 @@ model_args:
 data_args:
   data_names:
     - "icot_full"
-    # - "commonsense"
+    - "commonsense"
     # - "strategy"
-  max_samples: 100
+  max_samples: null
 
 # Wandb Arguments
 wandb:
   project: "codi"
-  run_name: "codi_llama1b_gsm8k_commonsense-test"
+  run_name: "codi_llama1b-answer_only_ans_ce_loss_only"
 
 # Hub Arguments
 hub:
@@ -28,14 +28,14 @@ hub:
 
 # Training Arguments
 training_args:
-  output_dir: "./models/codi_llama1b_test"
-  expt_name: "codi_llama1b_test"
-  logging_dir: "./models/codi_llama1b_test/logs"
+  output_dir: "./models/codi_llama1b-answer_only_ans_ce_loss_only"
+  expt_name: "codi_llama1b-answer_only_ans_ce_loss_only"
+  logging_dir: "./models/codi_llama1b-answer_only_ans_ce_loss_only/logs"
   logging_steps: 10
   seed: 11
   model_max_length: 512
-  per_device_train_batch_size: 32
-  gradient_accumulation_steps: 1
+  per_device_train_batch_size: 64
+  gradient_accumulation_steps: 2
   bf16: true
   max_steps: -1
   num_train_epochs: 10

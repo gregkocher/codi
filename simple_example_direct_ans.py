@@ -5,14 +5,9 @@ from dotenv import load_dotenv
 from src.model import CODI
 
 load_dotenv()
-
-# llama3 3B id: bcywinski/codi_llama3b_gsm8k-strategyqa-commonsense
-# llama3 1B id: bcywinski/llama1b_gsm8k-strategyqa-commonsense
-# original: zen-E/CODI-llama3.2-1b-Instruct
-
 # %%
 model = CODI.from_pretrained(
-    checkpoint_path="bcywinski/codi_llama1b_gsm8k-answer-empty",  # HF checkpoint ID
+    checkpoint_path="bcywinski/codi_llama1b_gsm8k_commonsense-test",  # HF checkpoint ID
     model_name_or_path="meta-llama/Llama-3.2-1B-Instruct",  # HF base model ID
     lora_r=128,
     lora_alpha=32,
@@ -22,26 +17,46 @@ model = CODI.from_pretrained(
     dtype="bfloat16",
     strict=False,
     # Optional: specify where to save the checkpoint (default: ./checkpoints/{name})
-    checkpoint_save_path="./checkpoints/bcywinski/codi_llama1b_gsm8k-answer-empty",
+    checkpoint_save_path="./checkpoints/bcywinski/codi_llama1b_gsm8k_commonsense-test",
     remove_eos=True,
     full_precision=True,
 )
 # %%
 tokenizer = model.tokenizer
+additional_special_tokens = [
+    "<|bocot|>",
+    "<|eocot|>",
+]
+tokenizer.add_special_tokens({"additional_special_tokens": additional_special_tokens})
+tokenizer.bot_id = tokenizer.convert_tokens_to_ids("<|bocot|>")  # beginning of CoT
+tokenizer.eot_id = tokenizer.convert_tokens_to_ids("<|eocot|>")
 # %%
 # Tokenize input
-prompt = """The sanctions against the school were a punishing blow, and they seemed to what the efforts the school had made to change?
-Choices:
-A: ignore
-B: enforce
-C: authoritarian
-D: yell at
-E: avoid"""
+prompt = """Henry and 3 of his friends order 7 pizzas for lunch. Each pizza is cut into 8 slices. If Henry and his friends want to share the pizzas equally, how many slices can each of them have?"""
+# prompt = """Question: The sanctions against the school were a punishing blow, and they seemed to what the efforts the school had made to change?
+# Choices:
+# A: ignore
+# B: enforce
+# C: authoritarian
+# D: yell at
+# E: avoid"""
 inputs = tokenizer(prompt, return_tensors="pt")
 input_ids = inputs["input_ids"].to(model.codi.device)
 attention_mask = inputs["attention_mask"].to(model.codi.device)
+# # %%
+# outputs = model.codi.generate(
+#     input_ids=input_ids,
+#     max_new_tokens=256,
+#     temperature=0.1,
+#     top_k=40,
+#     top_p=0.95,
+#     attention_mask=attention_mask,
+#     pad_token_id=tokenizer.pad_token_id,
+# )
+# print(tokenizer.decode(outputs[0], skip_special_tokens=False))
 # %%
-skip_thinking = True
+skip_thinking = False
+verbalize_cot = True
 # Generate with latent reasoning
 output = model.generate(
     input_ids=input_ids,
@@ -52,13 +67,13 @@ output = model.generate(
     temperature=0.1,
     greedy=True,
     return_latent_vectors=True,  # Get the latent reasoning vectors
-    remove_eos=True,
+    remove_eos=False,
     output_attentions=False,  # Get attention weights
     skip_thinking=skip_thinking,
     output_hidden_states=True,
-    sot_token=tokenizer.convert_tokens_to_ids(
-        "<|ans|>" if skip_thinking else "<|bocot|>"
-    ),
+    verbalize_cot=verbalize_cot,
+    sot_token=tokenizer.convert_tokens_to_ids("<|bocot|>"),
+    eot_token=tokenizer.convert_tokens_to_ids("<|eocot|>"),
 )
 # %%
 # Decode and print output
@@ -69,7 +84,7 @@ print(f"Generated: {generated_text}")
 print(f"\nNumber of latent reasoning vectors: {len(output['latent_vectors'])}")
 print(f"Each latent vector shape: {output['latent_vectors'][0].shape}")
 # %%
-hs = torch.stack(output["hidden_states"]).to("cpu")
+hs = output["hidden_states"].to("cpu")
 hs.shape
 # %%
 latent_vectors = torch.stack(output["latent_vectors"]).squeeze(1).squeeze(1).to("cpu")
@@ -82,7 +97,7 @@ sims.shape
 # %%
 sims = sims.softmax(dim=-1)
 # %%
-k = 50
+k = 20
 for i in range(sims.shape[0]):
     topk = sims[i].topk(k, dim=-1)
     topk_indices = topk.indices.tolist()
