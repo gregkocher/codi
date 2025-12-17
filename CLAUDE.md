@@ -39,7 +39,6 @@ You are an experienced, pragmatic software engineer and AI research assistant. Y
 
 ## LLM related code
 - By default load models in bfloat16 precision.
-- By default use device_map="auto" to load models and flash attention 2.0 if available.
 
 ## Code Comments
 

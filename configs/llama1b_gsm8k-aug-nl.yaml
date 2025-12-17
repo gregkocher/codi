@@ -18,24 +18,24 @@ data_args:
 # Wandb Arguments
 wandb:
   project: "codi"
-  run_name: "codi_llama1b-answer_only_ans_ce_loss_only"
+  run_name: "codi_llama1b-answer_only"
 
 # Hub Arguments
 hub:
   push_to_hub: true
-  account: "bcywinski"
+  account: "HF_ACCOUNT"
   private_repo: false
 
 # Training Arguments
 training_args:
-  output_dir: "./models/codi_llama1b-answer_only_ans_ce_loss_only"
-  expt_name: "codi_llama1b-answer_only_ans_ce_loss_only"
-  logging_dir: "./models/codi_llama1b-answer_only_ans_ce_loss_only/logs"
+  output_dir: "./models/codi_llama1b-answer_only"
+  expt_name: "codi_llama1b-answer_only"
+  logging_dir: "./models/codi_llama1b-answer_only/logs"
   logging_steps: 10
   seed: 11
   model_max_length: 512
-  per_device_train_batch_size: 64
-  gradient_accumulation_steps: 2
+  per_device_train_batch_size: 32
+  gradient_accumulation_steps: 1
   bf16: true
   max_steps: -1
   num_train_epochs: 10

@@ -9,8 +9,9 @@
 ```
 uv venv
 uv pip install -r requirements.txt
-uv pip install flash-attn --no-build-isolation
 ```
+
+Set required environment variables in a `.env` file.
 
 ## Train a CODI model
 
@@ -30,6 +31,14 @@ bash scripts/test_llama1b.sh
 ```
 
 ## Reproduce the experiments in the post
+
+First prepare the prompts as JSON.
+```bash
+python prepare_prompts_json.py
+```
+
+Then execute script experiments. Experiments are sorted according to the order in the blog post.
+
 ```bash
 python experiments/1_latent_iterations_accuracy.py
 python experiments/2_latent_token_probability_numbers.py
