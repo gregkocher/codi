@@ -37,6 +37,26 @@ from src.templates import ADDITION_FIRST_TEMPLATES, SUBTRACTION_FIRST_TEMPLATES
 # ============================================================================
 
 
+def generate_random_latents(reference_latents, seed=None):
+    """
+    Generate random latent vectors with the same shape and statistics as reference.
+
+    Uses the same mean and std as the reference latents for each position.
+    """
+    if seed is not None:
+        torch.manual_seed(seed)
+
+    random_latents = []
+    for pos_latent in reference_latents:
+        # Match the shape, dtype, and approximate statistics
+        mean = pos_latent.mean()
+        std = pos_latent.std()
+        random_vec = torch.randn_like(pos_latent) * std + mean
+        random_latents.append(random_vec)
+
+    return random_latents
+
+
 def prepare_inputs(model, tokenizer, prompt):
     """Construct input sequence: [Prompt Tokens] + [BOCOT]"""
     device = model.codi.device
@@ -458,6 +478,7 @@ def main(
     # Results storage
     results_same = {pos: [] for pos in positions_to_test}  # Same intermediate
     results_diff = {pos: [] for pos in positions_to_test}  # Different intermediate
+    results_random = {pos: [] for pos in positions_to_test}  # Random vectors
     detailed_results = []
 
     # Phase 3: Run patching experiment
@@ -495,6 +516,10 @@ def main(
         diff_key = different_keys[np.random.randint(len(different_keys))]
         diff_mean_latents = group_mean_latents[diff_key]
 
+        # Generate random latents for this prompt (use prompt_idx as seed for reproducibility)
+        reference_latents = same_mean_latents  # Use same shape/stats as real latents
+        random_latents = generate_random_latents(reference_latents, seed=seed + prompt_idx)
+
         prompt_results = {
             "prompt_idx": prompt_idx,
             "prompt_info": {
@@ -513,7 +538,7 @@ def main(
 
         for position in positions_to_test:
             pos_key = "baseline" if position is None else str(position)
-            prompt_results["positions"][pos_key] = {"same": [], "diff": []}
+            prompt_results["positions"][pos_key] = {"same": [], "diff": [], "random": []}
 
             for sample_idx in range(num_samples):
                 # Baseline or Same intermediate patching
@@ -551,11 +576,13 @@ def main(
                         and int(answer) == ground_truth
                     )
 
-                    # Baseline is the same for both conditions
+                    # Baseline is the same for all conditions
                     results_same[position].append(correct)
                     results_diff[position].append(correct)
+                    results_random[position].append(correct)
                     prompt_results["positions"][pos_key]["same"].append(correct)
                     prompt_results["positions"][pos_key]["diff"].append(correct)
+                    prompt_results["positions"][pos_key]["random"].append(correct)
                 else:
                     # Same intermediate patching
                     output_same = generate_with_mean_latent_patching(
@@ -605,6 +632,30 @@ def main(
                     results_diff[position].append(correct_diff)
                     prompt_results["positions"][pos_key]["diff"].append(correct_diff)
 
+                    # Random vector patching
+                    output_random = generate_with_mean_latent_patching(
+                        model,
+                        tokenizer,
+                        prompt,
+                        patch_position=position,
+                        mean_latent=random_latents[position],
+                        max_new_tokens=128,
+                        num_latent_iterations=num_latent_iterations,
+                        temperature=temperature,
+                        greedy=greedy,
+                    )
+                    text_random = tokenizer.decode(
+                        output_random["sequences"][0], skip_special_tokens=False
+                    )
+                    answer_random = extract_answer_number(text_random)
+                    correct_random = (
+                        answer_random is not None
+                        and answer_random != float("inf")
+                        and int(answer_random) == ground_truth
+                    )
+                    results_random[position].append(correct_random)
+                    prompt_results["positions"][pos_key]["random"].append(correct_random)
+
         detailed_results.append(prompt_results)
 
     # Calculate aggregate statistics
@@ -615,8 +666,10 @@ def main(
     # Calculate accuracies
     accuracies_same = {}
     accuracies_diff = {}
+    accuracies_random = {}
     std_same = {}
     std_diff = {}
+    std_random = {}
 
     for pos in positions_to_test:
         pos_key = "baseline" if pos is None else str(pos)
@@ -638,8 +691,19 @@ def main(
             accuracies_diff[pos_key] = 0.0
             std_diff[pos_key] = 0.0
 
+        if len(results_random[pos]) > 0:
+            accuracies_random[pos_key] = np.mean(results_random[pos])
+            std_random[pos_key] = np.std(results_random[pos]) / np.sqrt(
+                len(results_random[pos])
+            )
+        else:
+            accuracies_random[pos_key] = 0.0
+            std_random[pos_key] = 0.0
+
         print(
-            f"Position {pos_key:10s}: Same={accuracies_same[pos_key]:.4f}±{std_same[pos_key]:.4f}  Diff={accuracies_diff[pos_key]:.4f}±{std_diff[pos_key]:.4f}"
+            f"Position {pos_key:10s}: Same={accuracies_same[pos_key]:.4f}±{std_same[pos_key]:.4f}  "
+            f"Diff={accuracies_diff[pos_key]:.4f}±{std_diff[pos_key]:.4f}  "
+            f"Random={accuracies_random[pos_key]:.4f}±{std_random[pos_key]:.4f}"
         )
 
     # Calculate deltas from baseline
@@ -649,21 +713,27 @@ def main(
 
     deltas_same = {}
     deltas_diff = {}
+    deltas_random = {}
     delta_std_same = {}
     delta_std_diff = {}
+    delta_std_random = {}
 
     for pos in range(num_positions):
         pos_key = str(pos)
         deltas_same[pos_key] = accuracies_same[pos_key] - baseline_acc
         deltas_diff[pos_key] = accuracies_diff[pos_key] - baseline_acc
+        deltas_random[pos_key] = accuracies_random[pos_key] - baseline_acc
         delta_std_same[pos_key] = np.sqrt(std_same[pos_key] ** 2 + baseline_std**2)
         delta_std_diff[pos_key] = np.sqrt(std_diff[pos_key] ** 2 + baseline_std**2)
+        delta_std_random[pos_key] = np.sqrt(std_random[pos_key] ** 2 + baseline_std**2)
 
     print("\nDeltas from baseline:")
     for pos in range(num_positions):
         pos_key = str(pos)
         print(
-            f"  Position {pos_key}: Same={deltas_same[pos_key]:+.4f}±{delta_std_same[pos_key]:.4f}  Diff={deltas_diff[pos_key]:+.4f}±{delta_std_diff[pos_key]:.4f}"
+            f"  Position {pos_key}: Same={deltas_same[pos_key]:+.4f}±{delta_std_same[pos_key]:.4f}  "
+            f"Diff={deltas_diff[pos_key]:+.4f}±{delta_std_diff[pos_key]:.4f}  "
+            f"Random={deltas_random[pos_key]:+.4f}±{delta_std_random[pos_key]:.4f}"
         )
 
     # Save results
@@ -679,12 +749,16 @@ def main(
         },
         "accuracies_same": accuracies_same,
         "accuracies_diff": accuracies_diff,
+        "accuracies_random": accuracies_random,
         "std_same": std_same,
         "std_diff": std_diff,
+        "std_random": std_random,
         "deltas_same": deltas_same,
         "deltas_diff": deltas_diff,
+        "deltas_random": deltas_random,
         "delta_std_same": delta_std_same,
         "delta_std_diff": delta_std_diff,
+        "delta_std_random": delta_std_random,
         "baseline_accuracy": baseline_acc,
         "baseline_std": baseline_std,
         "detailed_results": detailed_results,
@@ -700,12 +774,16 @@ def main(
     create_visualizations(
         accuracies_same,
         accuracies_diff,
+        accuracies_random,
         std_same,
         std_diff,
+        std_random,
         deltas_same,
         deltas_diff,
+        deltas_random,
         delta_std_same,
         delta_std_diff,
+        delta_std_random,
         baseline_acc,
         baseline_std,
         num_positions,
@@ -718,12 +796,16 @@ def main(
 def create_visualizations(
     accuracies_same,
     accuracies_diff,
+    accuracies_random,
     std_same,
     std_diff,
+    std_random,
     deltas_same,
     deltas_diff,
+    deltas_random,
     delta_std_same,
     delta_std_diff,
+    delta_std_random,
     baseline_acc,
     baseline_std,
     num_positions,
@@ -738,39 +820,53 @@ def create_visualizations(
 
     positions = list(range(num_positions))
     x = np.arange(len(positions))
-    width = 0.35
+    width = 0.25  # Narrower bars to fit 3 conditions
 
     # =========================================================================
     # Plot 1: Absolute accuracy
     # =========================================================================
-    fig, ax = plt.subplots(figsize=(12, 6))
+    fig, ax = plt.subplots(figsize=(14, 6))
 
     same_accs = [accuracies_same[str(i)] for i in positions]
     diff_accs = [accuracies_diff[str(i)] for i in positions]
+    random_accs = [accuracies_random[str(i)] for i in positions]
     same_errors = [std_same[str(i)] for i in positions]
     diff_errors = [std_diff[str(i)] for i in positions]
+    random_errors = [std_random[str(i)] for i in positions]
 
     ax.bar(
-        x - width / 2,
+        x - width,
         same_accs,
         width,
         yerr=same_errors,
         label="Same Intermediate",
         color="#4CAF50",
         alpha=0.8,
-        capsize=8,
+        capsize=5,
         edgecolor="black",
         linewidth=2,
     )
     ax.bar(
-        x + width / 2,
+        x,
         diff_accs,
         width,
         yerr=diff_errors,
         label="Different Intermediate",
         color="#e74c3c",
         alpha=0.8,
-        capsize=8,
+        capsize=5,
+        edgecolor="black",
+        linewidth=2,
+    )
+    ax.bar(
+        x + width,
+        random_accs,
+        width,
+        yerr=random_errors,
+        label="Random Vector",
+        color="#9b59b6",
+        alpha=0.8,
+        capsize=5,
         edgecolor="black",
         linewidth=2,
     )
@@ -808,34 +904,48 @@ def create_visualizations(
     # =========================================================================
     # Plot 2: Delta from baseline
     # =========================================================================
-    fig, ax = plt.subplots(figsize=(12, 6))
+    fig, ax = plt.subplots(figsize=(14, 6))
 
     same_deltas = [deltas_same[str(i)] for i in positions]
     diff_deltas = [deltas_diff[str(i)] for i in positions]
+    random_deltas = [deltas_random[str(i)] for i in positions]
     same_delta_errors = [delta_std_same[str(i)] for i in positions]
     diff_delta_errors = [delta_std_diff[str(i)] for i in positions]
+    random_delta_errors = [delta_std_random[str(i)] for i in positions]
 
     ax.bar(
-        x - width / 2,
+        x - width,
         same_deltas,
         width,
         yerr=same_delta_errors,
         label="Same Intermediate",
         color="#4CAF50",
         alpha=0.8,
-        capsize=8,
+        capsize=5,
         edgecolor="black",
         linewidth=2,
     )
     ax.bar(
-        x + width / 2,
+        x,
         diff_deltas,
         width,
         yerr=diff_delta_errors,
         label="Different Intermediate",
         color="#e74c3c",
         alpha=0.8,
-        capsize=8,
+        capsize=5,
+        edgecolor="black",
+        linewidth=2,
+    )
+    ax.bar(
+        x + width,
+        random_deltas,
+        width,
+        yerr=random_delta_errors,
+        label="Random Vector",
+        color="#9b59b6",
+        alpha=0.8,
+        capsize=5,
         edgecolor="black",
         linewidth=2,
     )
@@ -860,8 +970,8 @@ def create_visualizations(
     ax.grid(axis="y", alpha=0.2, linestyle="-", linewidth=0.8)
 
     # Adjust y-axis
-    all_vals = same_deltas + diff_deltas
-    all_errs = same_delta_errors + diff_delta_errors
+    all_vals = same_deltas + diff_deltas + random_deltas
+    all_errs = same_delta_errors + diff_delta_errors + random_delta_errors
     y_min = min(all_vals) - max(all_errs) - 0.1
     y_max = max(all_vals) + max(all_errs) + 0.15
     ax.set_ylim(y_min, y_max)
