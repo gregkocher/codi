@@ -26,7 +26,13 @@ from src.model import CODI
 CHECKPOINT_PATH = "bcywinski/codi_llama1b-answer_only"
 MODEL_NAME_OR_PATH = "meta-llama/Llama-3.2-1B-Instruct"
 
-DEVICE = "cuda"
+if torch.cuda.is_available():
+    DEVICE = "cuda"
+elif torch.backends.mps.is_available():
+    DEVICE = "mps"
+else:
+    DEVICE = "cpu"
+
 DTYPE = "bfloat16"
 
 NUM_LATENT_ITERATIONS = 6

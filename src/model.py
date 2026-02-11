@@ -261,7 +261,8 @@ class CODI(torch.nn.Module):
         )
 
         # Create training arguments
-        bf16 = dtype == "bfloat16"
+        # bf16 flag in TrainingArguments requires CUDA; disable for non-CUDA devices
+        bf16 = dtype == "bfloat16" and device == "cuda" and torch.cuda.is_available()
         training_args = TrainingArguments(
             output_dir="./output",  # Dummy, not used for inference
             model_max_length=model_max_length,
@@ -382,6 +383,13 @@ class CODI(torch.nn.Module):
             model = model.to(device)
             if dtype == "bfloat16":
                 model = model.to(torch.bfloat16)
+            else:
+                model = model.to(torch.float16)
+        elif device == "mps" and torch.backends.mps.is_available():
+            model = model.to(device)
+            # MPS supports float16 and float32; bfloat16 has partial support
+            if dtype == "bfloat16":
+                model = model.to(torch.float32)
             else:
                 model = model.to(torch.float16)
         elif device == "cpu":
