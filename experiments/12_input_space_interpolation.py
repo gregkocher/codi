@@ -10,9 +10,11 @@ import sys
 from pathlib import Path
 
 import fire
+import matplotlib.colors as mcolors
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+import umap
 from dotenv import load_dotenv
 from sklearn.manifold import TSNE
 
@@ -321,7 +323,7 @@ def visualize_answer_vs_x(all_results, x_values, base_number, results_dir):
 
 def visualize_logit_lens_heatmap(all_results, x_values, tokenizer, results_dir):
     """
-    Heatmap: rows = X values, columns = latent positions.
+    Heatmap: rows = X values, columns = latent vector index (0..K).
     Each cell shows top-1 token from the final analyzed layer.
     """
     num_x = len(x_values)
@@ -360,14 +362,10 @@ def visualize_logit_lens_heatmap(all_results, x_values, tokenizer, results_dir):
                 ha="center", va="center", color=text_color, fontsize=8,
             )
 
-    ax.set_xlabel("Latent Position", fontsize=13, fontweight="bold")
+    ax.set_xlabel("Latent Vector Index", fontsize=13, fontweight="bold")
     ax.set_ylabel("X (input number)", fontsize=13, fontweight="bold")
     ax.set_xticks(range(num_positions))
-    pos_labels = [
-        str(d["position"])
-        for d in all_results[x_values[0]]["latent_logit_lens"]
-    ]
-    ax.set_xticklabels(pos_labels, fontsize=10)
+    ax.set_xticklabels([str(i) for i in range(num_positions)], fontsize=10)
     ax.set_yticks(range(num_x))
     ax.set_yticklabels([str(x) for x in x_values], fontsize=10)
     ax.set_title(
@@ -377,6 +375,81 @@ def visualize_logit_lens_heatmap(all_results, x_values, tokenizer, results_dir):
 
     plt.tight_layout()
     path = results_dir / "logit_lens_heatmap.png"
+    fig.savefig(path, dpi=200, bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+    print(f"Saved: {path}")
+
+
+def visualize_logit_lens_heatmap_top5(all_results, x_values, tokenizer, results_dir):
+    """
+    Heatmap: rows = X values, columns = latent vector index (0..K).
+    Each cell shows the top-1 token prominently and tokens 2-5 in smaller
+    font below in parentheses.
+    """
+    num_x = len(x_values)
+    num_positions = len(all_results[x_values[0]]["latent_logit_lens"])
+
+    # Collect top-5 tokens and top-1 probability per cell
+    top5_matrix = []  # [row][col] = list of 5 token strings
+    prob_matrix = np.zeros((num_x, num_positions))
+
+    for row_idx, x in enumerate(x_values):
+        row_top5 = []
+        for p_idx, pos_data in enumerate(all_results[x]["latent_logit_lens"]):
+            final_layer = pos_data["logit_lens"][-1]
+            tokens_5 = []
+            for k in range(min(5, len(final_layer["top_indices"]))):
+                tid = final_layer["top_indices"][k]
+                tokens_5.append(tokenizer.decode([tid]))
+            row_top5.append(tokens_5)
+            prob_matrix[row_idx, p_idx] = final_layer["top_probs"][0]
+        top5_matrix.append(row_top5)
+
+    # Taller rows to accommodate the extra text
+    fig, ax = plt.subplots(
+        figsize=(3 + num_positions * 2.2, 2 + num_x * 0.85)
+    )
+
+    im = ax.imshow(prob_matrix, cmap="YlOrRd", aspect="auto", vmin=0, vmax=1)
+    cbar = plt.colorbar(im, ax=ax)
+    cbar.set_label("Top-1 probability", rotation=270, labelpad=15, fontsize=12)
+
+    for i in range(num_x):
+        for j in range(num_positions):
+            tokens = top5_matrix[i][j]
+            prob = prob_matrix[i, j]
+            text_color = "white" if prob > 0.5 else "black"
+
+            # Top-1 token — prominent
+            top1_display = repr(tokens[0])[1:-1] if tokens else ""
+            ax.text(
+                j, i - 0.15, top1_display,
+                ha="center", va="center", color=text_color,
+                fontsize=8, fontweight="bold",
+            )
+
+            # Tokens 2-5 — smaller, in parentheses below
+            if len(tokens) > 1:
+                rest = ", ".join(repr(t)[1:-1] for t in tokens[1:5])
+                ax.text(
+                    j, i + 0.2, f"({rest})",
+                    ha="center", va="center", color=text_color,
+                    fontsize=5,
+                )
+
+    ax.set_xlabel("Latent Vector Index", fontsize=13, fontweight="bold")
+    ax.set_ylabel("X (input number)", fontsize=13, fontweight="bold")
+    ax.set_xticks(range(num_positions))
+    ax.set_xticklabels([str(i) for i in range(num_positions)], fontsize=10)
+    ax.set_yticks(range(num_x))
+    ax.set_yticklabels([str(x) for x in x_values], fontsize=10)
+    ax.set_title(
+        "Top-5 Logit Lens Tokens (Final Layer) vs Input X",
+        fontsize=14, fontweight="bold", pad=12,
+    )
+
+    plt.tight_layout()
+    path = results_dir / "logit_lens_heatmap_top5.png"
     fig.savefig(path, dpi=200, bbox_inches="tight", facecolor="white")
     plt.close(fig)
     print(f"Saved: {path}")
@@ -433,7 +506,7 @@ def visualize_drift_from_first(drift, x_values, results_dir):
 
     fig, ax = plt.subplots(figsize=(max(12, len(x_values) * 0.5), 5))
 
-    cmap = plt.cm.viridis
+    cmap = plt.cm.coolwarm
     num_positions = len(drift)
     colors = [cmap(i / max(1, num_positions - 1)) for i in range(num_positions)]
 
@@ -476,7 +549,7 @@ def visualize_consecutive_cosine_sims(consec_sims, x_values, results_dir):
 
     fig, ax = plt.subplots(figsize=(max(12, len(indices) * 0.5), 5))
 
-    cmap = plt.cm.viridis
+    cmap = plt.cm.coolwarm
     num_positions = len(consec_sims)
     colors = [cmap(i / max(1, num_positions - 1)) for i in range(num_positions)]
 
@@ -506,16 +579,9 @@ def visualize_consecutive_cosine_sims(consec_sims, x_values, results_dir):
     print(f"Saved: {path}")
 
 
-def visualize_tsne(all_vectors, x_values, results_dir, perplexity=5, seed=42):
-    """
-    t-SNE plot of all latent vectors. Points colored by latent position,
-    with lines connecting same-position points across X values.
-    Also creates a second plot colored by X value.
-    """
+def _flatten_vectors(all_vectors, x_values):
+    """Flatten all latent vectors into arrays + label arrays for plotting."""
     num_positions = len(all_vectors[x_values[0]])
-    N = len(x_values)
-
-    # Flatten all vectors into a matrix: (N * num_positions, hidden_dim)
     all_vecs = []
     labels_position = []
     labels_x = []
@@ -525,23 +591,26 @@ def visualize_tsne(all_vectors, x_values, results_dir, perplexity=5, seed=42):
             all_vecs.append(v)
             labels_position.append(pos)
             labels_x.append(x)
-
-    all_vecs = np.array(all_vecs)
-    labels_position = np.array(labels_position)
-    labels_x = np.array(labels_x)
-
-    # Adjust perplexity if we have very few samples
-    effective_perplexity = min(perplexity, max(2, len(all_vecs) // 4))
-
-    tsne = TSNE(
-        n_components=2, perplexity=effective_perplexity,
-        random_state=seed, max_iter=2000, learning_rate="auto", init="pca",
+    return (
+        np.array(all_vecs),
+        np.array(labels_position),
+        np.array(labels_x),
+        num_positions,
     )
-    embeddings = tsne.fit_transform(all_vecs)
 
-    # ---- Plot 1: colored by latent position, lines connect same position ----
-    fig, ax = plt.subplots(figsize=(12, 9))
 
+def _x_color_norm(x_values):
+    """Return a color normalizer for X values; uses LogNorm when range > 100x."""
+    x_min, x_max = min(x_values), max(x_values)
+    if x_min > 0 and x_max / x_min > 100:
+        return mcolors.LogNorm(vmin=x_min, vmax=x_max)
+    return plt.Normalize(vmin=x_min, vmax=x_max)
+
+
+def _plot_embeddings_by_position(
+    embeddings, labels_position, x_values, num_positions, ax, method_name,
+):
+    """Plot 2-D embeddings colored by latent position with connecting lines."""
     cmap = plt.cm.tab10
     for pos in range(num_positions):
         mask = labels_position == pos
@@ -549,20 +618,15 @@ def visualize_tsne(all_vectors, x_values, results_dir, perplexity=5, seed=42):
         color = cmap(pos % 10)
         label = "Prompt" if pos == 0 else f"Latent {pos - 1}"
 
-        # Draw connecting lines (in order of X)
         ax.plot(
             embeddings[idxs, 0], embeddings[idxs, 1],
             "-", color=color, linewidth=1.0, alpha=0.4, zorder=1,
         )
-
-        # Draw points
         ax.scatter(
             embeddings[idxs, 0], embeddings[idxs, 1],
             c=[color], s=50, label=label, zorder=2, edgecolors="white",
             linewidth=0.5,
         )
-
-        # Annotate first and last X
         ax.annotate(
             f"X={x_values[0]}", (embeddings[idxs[0], 0], embeddings[idxs[0], 1]),
             fontsize=6, color=color, alpha=0.8,
@@ -572,60 +636,121 @@ def visualize_tsne(all_vectors, x_values, results_dir, perplexity=5, seed=42):
             fontsize=6, color=color, alpha=0.8,
         )
 
-    ax.set_xlabel("t-SNE dim 1", fontsize=12)
-    ax.set_ylabel("t-SNE dim 2", fontsize=12)
+    ax.set_xlabel(f"{method_name} dim 1", fontsize=12)
+    ax.set_ylabel(f"{method_name} dim 2", fontsize=12)
     ax.set_title(
-        "t-SNE of Latent Vectors (colored by position, connected across X)",
+        f"{method_name} of Latent Vectors (colored by position, connected across X)",
         fontsize=14, fontweight="bold",
     )
     ax.legend(fontsize=9, loc="best")
     ax.grid(True, alpha=0.2)
 
+
+def _plot_embeddings_by_x(
+    embeddings, labels_x, x_values, ax, method_name,
+):
+    """Plot 2-D embeddings colored by X value with connecting lines."""
+    norm = _x_color_norm(x_values)
+    cmap_x = plt.cm.coolwarm
+
+    for x in x_values:
+        mask = labels_x == x
+        idxs = np.where(mask)[0]
+        color = cmap_x(norm(x))
+
+        ax.plot(
+            embeddings[idxs, 0], embeddings[idxs, 1],
+            "-", color=color, linewidth=1.0, alpha=0.4, zorder=1,
+        )
+        ax.scatter(
+            embeddings[idxs, 0], embeddings[idxs, 1],
+            c=[color], s=50, zorder=2, edgecolors="white", linewidth=0.5,
+        )
+
+    sm = plt.cm.ScalarMappable(cmap=cmap_x, norm=norm)
+    sm.set_array([])
+    cbar = plt.colorbar(sm, ax=ax)
+    cbar.set_label("X (input number)", fontsize=12)
+
+    ax.set_xlabel(f"{method_name} dim 1", fontsize=12)
+    ax.set_ylabel(f"{method_name} dim 2", fontsize=12)
+    ax.set_title(
+        f"{method_name} of Latent Vectors (colored by input X, connected across positions)",
+        fontsize=14, fontweight="bold",
+    )
+    ax.grid(True, alpha=0.2)
+
+
+def visualize_tsne(all_vectors, x_values, results_dir, perplexity=5, seed=42):
+    """
+    t-SNE plot of all latent vectors. Points colored by latent position,
+    with lines connecting same-position points across X values.
+    Also creates a second plot colored by X value.
+    """
+    all_vecs, labels_position, labels_x, num_positions = _flatten_vectors(
+        all_vectors, x_values
+    )
+
+    effective_perplexity = min(perplexity, max(2, len(all_vecs) // 4))
+    tsne = TSNE(
+        n_components=2, perplexity=effective_perplexity,
+        random_state=seed, max_iter=2000, learning_rate="auto", init="pca",
+    )
+    embeddings = tsne.fit_transform(all_vecs)
+
+    # Plot 1: colored by latent position
+    fig, ax = plt.subplots(figsize=(12, 9))
+    _plot_embeddings_by_position(
+        embeddings, labels_position, x_values, num_positions, ax, "t-SNE",
+    )
     plt.tight_layout()
     path = results_dir / "tsne_by_position.png"
     fig.savefig(path, dpi=200, bbox_inches="tight", facecolor="white")
     plt.close(fig)
     print(f"Saved: {path}")
 
-    # ---- Plot 2: colored by X value, lines connect same X across positions ----
+    # Plot 2: colored by X value
     fig, ax = plt.subplots(figsize=(12, 9))
-
-    x_min, x_max = min(x_values), max(x_values)
-    norm = plt.Normalize(vmin=x_min, vmax=x_max)
-    cmap_x = plt.cm.coolwarm
-
-    for x_idx, x in enumerate(x_values):
-        mask = labels_x == x
-        idxs = np.where(mask)[0]
-        color = cmap_x(norm(x))
-
-        # Draw connecting lines (positions 0, 1, ..., K in order)
-        ax.plot(
-            embeddings[idxs, 0], embeddings[idxs, 1],
-            "-", color=color, linewidth=1.0, alpha=0.4, zorder=1,
-        )
-
-        ax.scatter(
-            embeddings[idxs, 0], embeddings[idxs, 1],
-            c=[color], s=50, zorder=2, edgecolors="white", linewidth=0.5,
-        )
-
-    # Add colorbar for X values
-    sm = plt.cm.ScalarMappable(cmap=cmap_x, norm=norm)
-    sm.set_array([])
-    cbar = plt.colorbar(sm, ax=ax)
-    cbar.set_label("X (input number)", fontsize=12)
-
-    ax.set_xlabel("t-SNE dim 1", fontsize=12)
-    ax.set_ylabel("t-SNE dim 2", fontsize=12)
-    ax.set_title(
-        "t-SNE of Latent Vectors (colored by input X, connected across positions)",
-        fontsize=14, fontweight="bold",
-    )
-    ax.grid(True, alpha=0.2)
-
+    _plot_embeddings_by_x(embeddings, labels_x, x_values, ax, "t-SNE")
     plt.tight_layout()
     path = results_dir / "tsne_by_x_value.png"
+    fig.savefig(path, dpi=200, bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+    print(f"Saved: {path}")
+
+
+def visualize_umap(all_vectors, x_values, results_dir, n_neighbors=15, min_dist=0.1, seed=42):
+    """
+    UMAP plot of all latent vectors. Same two sub-plots as t-SNE:
+    colored by latent position and colored by X value.
+    """
+    all_vecs, labels_position, labels_x, num_positions = _flatten_vectors(
+        all_vectors, x_values
+    )
+
+    effective_neighbors = min(n_neighbors, max(2, len(all_vecs) - 1))
+    reducer = umap.UMAP(
+        n_components=2, n_neighbors=effective_neighbors,
+        min_dist=min_dist, random_state=seed, metric="cosine",
+    )
+    embeddings = reducer.fit_transform(all_vecs)
+
+    # Plot 1: colored by latent position
+    fig, ax = plt.subplots(figsize=(12, 9))
+    _plot_embeddings_by_position(
+        embeddings, labels_position, x_values, num_positions, ax, "UMAP",
+    )
+    plt.tight_layout()
+    path = results_dir / "umap_by_position.png"
+    fig.savefig(path, dpi=200, bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+    print(f"Saved: {path}")
+
+    # Plot 2: colored by X value
+    fig, ax = plt.subplots(figsize=(12, 9))
+    _plot_embeddings_by_x(embeddings, labels_x, x_values, ax, "UMAP")
+    plt.tight_layout()
+    path = results_dir / "umap_by_x_value.png"
     fig.savefig(path, dpi=200, bbox_inches="tight", facecolor="white")
     plt.close(fig)
     print(f"Saved: {path}")
@@ -642,7 +767,7 @@ def visualize_vector_norms(all_vectors, x_values, results_dir):
 
     fig, ax = plt.subplots(figsize=(max(12, len(x_values) * 0.5), 5))
 
-    cmap = plt.cm.viridis
+    cmap = plt.cm.coolwarm
     colors = [cmap(i / max(1, num_positions - 1)) for i in range(num_positions)]
 
     for pos in range(num_positions):
@@ -900,6 +1025,7 @@ def main(
     print("\nCreating visualizations...")
     visualize_answer_vs_x(all_results, x_values, base_number, results_dir)
     visualize_logit_lens_heatmap(all_results, x_values, tokenizer, results_dir)
+    visualize_logit_lens_heatmap_top5(all_results, x_values, tokenizer, results_dir)
     visualize_cosine_similarity_matrices(cos_matrices, x_values, results_dir)
     visualize_drift_from_first(drift, x_values, results_dir)
     visualize_consecutive_cosine_sims(consec_sims, x_values, results_dir)
@@ -908,6 +1034,9 @@ def main(
     print("Running t-SNE...")
     visualize_tsne(all_vectors, x_values, results_dir,
                    perplexity=tsne_perplexity, seed=seed)
+
+    print("Running UMAP...")
+    visualize_umap(all_vectors, x_values, results_dir, seed=seed)
 
     print("\nExperiment complete!")
 
