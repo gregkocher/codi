@@ -10,6 +10,8 @@ from peft import LoraConfig, TaskType, get_peft_model
 from safetensors.torch import load_file
 from transformers import AutoModelForCausalLM
 
+from src.noise import add_norm_preserving_noise
+
 
 @dataclass
 class ModelArguments:
@@ -723,6 +725,9 @@ class CODI(torch.nn.Module):
         sot_token: int = None,
         verbalize_cot: bool = False,
         eot_token: int = None,
+        noise_positions: list[int] | None = None,
+        noise_scale: float = 0.1,
+        noise_generator: torch.Generator | None = None,
     ):
         """
         Generate text with latent reasoning steps.
@@ -743,6 +748,10 @@ class CODI(torch.nn.Module):
             output_hidden_states: Whether to return hidden states computed on ALL positions (prompt + latent + generated)
             skip_thinking: Whether to skip the thinking/latent reasoning phase
             sot_token: Whether to use the sot token for the generation
+            noise_positions: List of latent iteration indices (0-based) at which to inject
+                norm-preserving Gaussian noise. None means no noise.
+            noise_scale: Standard deviation multiplier for the Gaussian noise.
+            noise_generator: Optional torch.Generator for reproducible noise.
         Returns:
             dict with keys:
                 - 'sequences': Generated token IDs of shape (batch_size, generated_length)
@@ -878,11 +887,17 @@ class CODI(torch.nn.Module):
                     dtype=self.codi.dtype
                 )  # FIX: layer norm casts to fp32
 
+            # Inject noise at position 0 (initial latent)
+            if noise_positions is not None and 0 in noise_positions:
+                latent_embd = add_norm_preserving_noise(
+                    latent_embd, noise_scale, generator=noise_generator
+                )
+
             if return_latent_vectors:
                 latent_vectors.append(latent_embd.clone())
 
             # Latent iterations: collect hidden states
-            for _ in range(num_latent_iterations):
+            for _latent_idx in range(num_latent_iterations):
                 outputs = self.codi(
                     inputs_embeds=latent_embd,
                     use_cache=True,
@@ -900,6 +915,15 @@ class CODI(torch.nn.Module):
                     latent_embd = latent_embd.to(
                         dtype=self.codi.dtype
                     )  # FIX: layer norm casts to fp32
+
+                # Inject noise at this latent position (1-indexed in the loop)
+                if (
+                    noise_positions is not None
+                    and (_latent_idx + 1) in noise_positions
+                ):
+                    latent_embd = add_norm_preserving_noise(
+                        latent_embd, noise_scale, generator=noise_generator
+                    )
 
                 if return_latent_vectors:
                     latent_vectors.append(latent_embd.clone())
