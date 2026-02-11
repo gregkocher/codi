@@ -3,6 +3,7 @@
 # ABOUTME: with norm-preserving noise at specified latent positions.
 
 # %%
+import importlib
 import json
 import sys
 from pathlib import Path
@@ -15,10 +16,19 @@ from dotenv import load_dotenv
 from transformers.cache_utils import DynamicCache
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
+sys.path.insert(0, str(Path(__file__).parent))
 
 from src.datasets import extract_answer_number
 from src.model import CODI
 from src.noise import add_norm_preserving_noise
+
+# Import shared utilities from experiment 3
+_exp3 = importlib.import_module("3_logit_lens_latents")
+get_lm_head = _exp3.get_lm_head
+get_layer_norm = _exp3.get_layer_norm
+logit_lens = _exp3.logit_lens
+prepare_inputs = _exp3.prepare_inputs
+ensure_tokenizer_special_tokens = _exp3.ensure_tokenizer_special_tokens
 
 # %%
 # Parameters
@@ -39,102 +49,6 @@ DEFAULT_PROMPT = (
 DEFAULT_GROUND_TRUTH = (3 + 5) * 2 + (3 + 5)  # = 24
 
 RESULTS_DIR = Path(__file__).parent.parent / "results" / "noisy_latent_rollouts"
-
-
-# ============================================================================
-# Model Utilities (reused from experiments 3 and 4)
-# ============================================================================
-
-
-def get_lm_head(model):
-    """Get the language model head (unembedding matrix) from the model."""
-    return model.codi.get_base_model().lm_head
-
-
-def get_layer_norm(model):
-    """Get the final layer norm before the lm_head."""
-    return model.codi.get_base_model().model.norm
-
-
-def logit_lens_batched(
-    hidden_states, lm_head, layer_norm, top_k=5, layer_indices=None
-):
-    """
-    Apply logit lens to hidden states for all batch elements at once.
-
-    Args:
-        hidden_states: Tuple of hidden states from each layer,
-            each of shape (batch, seq, hidden).
-        lm_head: The unembedding matrix (linear layer).
-        layer_norm: Final layer norm to apply before unembedding.
-        top_k: Number of top tokens to return.
-        layer_indices: Optional list of layer indices to analyze. None = all layers.
-
-    Returns:
-        List of N lists (one per batch element), where each inner list has one dict
-        per analyzed layer with keys: layer, top_indices, top_probs.
-    """
-    batch_size = hidden_states[0].shape[0]
-    batch_results = [[] for _ in range(batch_size)]
-
-    if layer_indices is None:
-        indices_to_use = range(len(hidden_states))
-    else:
-        indices_to_use = layer_indices
-
-    for layer_idx in indices_to_use:
-        h = hidden_states[layer_idx]
-        h_last = h[:, -1, :]  # (batch, hidden)
-        h_last = layer_norm(h_last)
-        logits = lm_head(h_last)  # (batch, vocab)
-        probs = torch.softmax(logits, dim=-1)
-        top_probs, top_indices = torch.topk(probs, top_k, dim=-1)  # (batch, top_k)
-
-        # Single .cpu() per layer instead of per-element
-        top_indices_cpu = top_indices.cpu()
-        top_probs_cpu = top_probs.cpu()
-
-        for b in range(batch_size):
-            batch_results[b].append(
-                {
-                    "layer": layer_idx,
-                    "top_indices": top_indices_cpu[b].tolist(),
-                    "top_probs": top_probs_cpu[b].tolist(),
-                }
-            )
-
-    return batch_results
-
-
-def prepare_inputs(model, tokenizer, prompt):
-    """Construct input sequence: [Prompt Tokens] + [EOS] + [BOCOT]"""
-    device = model.codi.device
-
-    inputs = tokenizer(
-        prompt, return_tensors="pt", padding=False, add_special_tokens=True
-    )
-    input_ids = inputs["input_ids"].to(device)
-    attention_mask = inputs["attention_mask"].to(device)
-
-    sot_id = tokenizer.convert_tokens_to_ids("<|bocot|>")
-    eos_id = tokenizer.eos_token_id
-
-    bot_tensor = torch.tensor([[eos_id, sot_id]], dtype=torch.long, device=device)
-    input_ids_bot = torch.cat([input_ids, bot_tensor], dim=1)
-    attention_mask_bot = torch.cat(
-        [attention_mask, torch.ones_like(bot_tensor)], dim=1
-    )
-
-    return input_ids_bot, attention_mask_bot
-
-
-def ensure_tokenizer_special_tokens(tokenizer) -> None:
-    if tokenizer.pad_token_id is None:
-        tokenizer.add_special_tokens({"pad_token": "[PAD]"})
-        tokenizer.pad_token_id = tokenizer.convert_tokens_to_ids("[PAD]")
-    tokenizer.add_special_tokens(
-        {"additional_special_tokens": ["<|bocot|>", "<|eocot|>"]}
-    )
 
 
 # ============================================================================
@@ -287,17 +201,15 @@ def run_batched_noisy_rollouts(
             )
             past_kv = outputs.past_key_values
 
-            # Logit lens — operates on the full batch at once
-            per_element_lens = logit_lens_batched(
-                outputs.hidden_states,
-                lm_head,
-                layer_norm,
-                top_k=top_k_tokens,
-                layer_indices=resolved_layers,
-            )
+            # Logit lens — per batch element using shared logit_lens
             for b in range(N):
+                hs_b = tuple(h[b : b + 1] for h in outputs.hidden_states)
+                lens_result = logit_lens(
+                    hs_b, lm_head, layer_norm,
+                    top_k=top_k_tokens, layer_indices=resolved_layers,
+                )
                 all_latent_logit_lens[b].append(
-                    {"position": i, "logit_lens": per_element_lens[b]}
+                    {"position": i, "logit_lens": lens_result}
                 )
 
             # Next latent embedding

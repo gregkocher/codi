@@ -52,7 +52,7 @@ def get_layer_norm(model):
     return None
 
 
-def logit_lens(hidden_states, lm_head, layer_norm=None, top_k=5):
+def logit_lens(hidden_states, lm_head, layer_norm=None, top_k=5, layer_indices=None):
     """
     Apply logit lens to hidden states.
 
@@ -61,13 +61,20 @@ def logit_lens(hidden_states, lm_head, layer_norm=None, top_k=5):
         lm_head: The unembedding matrix (linear layer)
         layer_norm: Optional final layer norm to apply before unembedding
         top_k: Number of top tokens to return
+        layer_indices: Optional list of layer indices to analyze. None = all layers.
 
     Returns:
-        List of (layer_idx, top_tokens, top_probs) for the last position
+        List of dicts with layer, top_indices, top_probs for the last position
     """
+    if layer_indices is None:
+        indices_to_use = range(len(hidden_states))
+    else:
+        indices_to_use = layer_indices
+
     results = []
 
-    for layer_idx, h in enumerate(hidden_states):
+    for layer_idx in indices_to_use:
+        h = hidden_states[layer_idx]
         # Take the last position
         h_last = h[:, -1, :]  # (batch, hidden)
 
@@ -93,6 +100,37 @@ def logit_lens(hidden_states, lm_head, layer_norm=None, top_k=5):
     return results
 
 
+def prepare_inputs(model, tokenizer, prompt):
+    """Construct input sequence: [Prompt Tokens] + [EOS] + [BOCOT]"""
+    device = model.codi.device
+
+    inputs = tokenizer(
+        prompt, return_tensors="pt", padding=False, add_special_tokens=True
+    )
+    input_ids = inputs["input_ids"].to(device)
+    attention_mask = inputs["attention_mask"].to(device)
+
+    sot_id = tokenizer.convert_tokens_to_ids("<|bocot|>")
+    eos_id = tokenizer.eos_token_id
+
+    bot_tensor = torch.tensor([[eos_id, sot_id]], dtype=torch.long, device=device)
+    input_ids_bot = torch.cat([input_ids, bot_tensor], dim=1)
+    attention_mask_bot = torch.cat(
+        [attention_mask, torch.ones_like(bot_tensor)], dim=1
+    )
+
+    return input_ids_bot, attention_mask_bot
+
+
+def ensure_tokenizer_special_tokens(tokenizer) -> None:
+    if tokenizer.pad_token_id is None:
+        tokenizer.add_special_tokens({"pad_token": "[PAD]"})
+        tokenizer.pad_token_id = tokenizer.convert_tokens_to_ids("[PAD]")
+    tokenizer.add_special_tokens(
+        {"additional_special_tokens": ["<|bocot|>", "<|eocot|>"]}
+    )
+
+
 def run_inference_with_logit_lens(
     model, tokenizer, prompt, num_latent_iterations, top_k=5
 ):
@@ -102,27 +140,12 @@ def run_inference_with_logit_lens(
     Returns:
         Dict with prompt_logit_lens and latent_logit_lens for each iteration
     """
-    device = next(model.parameters()).device
-
     # Get model components
     lm_head = get_lm_head(model)
     layer_norm = get_layer_norm(model)
 
-    # Tokenize
-    inputs = tokenizer(prompt, return_tensors="pt", padding=True)
-    input_ids = inputs["input_ids"].to(device)
-    attention_mask = inputs["attention_mask"].to(device)
-
-    # Special tokens
-    sot_token = tokenizer.convert_tokens_to_ids("<|bocot|>")
-
-    # Add BOT tokens
-    bot_tensor = torch.tensor(
-        [tokenizer.eos_token_id, sot_token], dtype=torch.long, device=device
-    ).unsqueeze(0)
-
-    input_ids_bot = torch.cat((input_ids, bot_tensor), dim=1)
-    attention_mask_bot = torch.cat((attention_mask, torch.ones_like(bot_tensor)), dim=1)
+    # Prepare input sequence: [Prompt] + [EOS] + [BOCOT]
+    input_ids_bot, attention_mask_bot = prepare_inputs(model, tokenizer, prompt)
 
     results = {
         "prompt": prompt,
@@ -288,57 +311,48 @@ def print_logit_lens_table(results, tokenizer, top_k=5):
 
 
 # %%
-def ensure_tokenizer_special_tokens(tokenizer, model) -> None:
-    if tokenizer.pad_token_id is None:
-        tokenizer.add_special_tokens({"pad_token": "[PAD]"})
-        tokenizer.pad_token_id = model.pad_token_id
-    tokenizer.add_special_tokens(
-        {"additional_special_tokens": ["<|bocot|>", "<|eocot|>"]}
+if __name__ == "__main__":
+    load_dotenv()
+
+    print("Loading model...")
+    model = CODI.from_pretrained(
+        checkpoint_path=CHECKPOINT_PATH,
+        model_name_or_path=MODEL_NAME_OR_PATH,
+        lora_r=128,
+        lora_alpha=32,
+        num_latent=6,
+        use_prj=True,
+        device=DEVICE,
+        dtype=DTYPE,
+        strict=False,
+        checkpoint_save_path=f"./checkpoints/{CHECKPOINT_PATH}",
+        remove_eos=False,
+        full_precision=True,
     )
+    tokenizer = model.tokenizer
+    ensure_tokenizer_special_tokens(tokenizer)
+    # %%
+    print("Running inference with logit lens...")
+    results = run_inference_with_logit_lens(
+        model=model,
+        tokenizer=tokenizer,
+        prompt=PROMPT,
+        num_latent_iterations=NUM_LATENT_ITERATIONS,
+        top_k=TOP_K_TOKENS,
+    )
+    # %%
+    # Print detailed table
+    print_logit_lens_table(results, tokenizer, top_k=TOP_K_TOKENS)
 
-
-# %%
-load_dotenv()
-
-print("Loading model...")
-model = CODI.from_pretrained(
-    checkpoint_path=CHECKPOINT_PATH,
-    model_name_or_path=MODEL_NAME_OR_PATH,
-    lora_r=128,
-    lora_alpha=32,
-    num_latent=6,
-    use_prj=True,
-    device=DEVICE,
-    dtype=DTYPE,
-    strict=False,
-    checkpoint_save_path=f"./checkpoints/{CHECKPOINT_PATH}",
-    remove_eos=False,
-    full_precision=True,
-)
-tokenizer = model.tokenizer
-ensure_tokenizer_special_tokens(tokenizer, model)
-# %%
-print("Running inference with logit lens...")
-results = run_inference_with_logit_lens(
-    model=model,
-    tokenizer=tokenizer,
-    prompt=PROMPT,
-    num_latent_iterations=NUM_LATENT_ITERATIONS,
-    top_k=TOP_K_TOKENS,
-)
-# %%
-# Print detailed table
-print_logit_lens_table(results, tokenizer, top_k=TOP_K_TOKENS)
-
-# Visualize
-fig = visualize_logit_lens(results, tokenizer)
-if fig is not None:
-    results_dir = "results/logit_lens_latents"
-    os.makedirs(results_dir, exist_ok=True)
-    output_path = os.path.join(results_dir, "logit_lens_latents.png")
-    fig.savefig(output_path, dpi=150, bbox_inches="tight")
-    print(f"\nSaved visualization to: {output_path}")
-    plt.show()
+    # Visualize
+    fig = visualize_logit_lens(results, tokenizer)
+    if fig is not None:
+        results_dir = "results/logit_lens_latents"
+        os.makedirs(results_dir, exist_ok=True)
+        output_path = os.path.join(results_dir, "logit_lens_latents.png")
+        fig.savefig(output_path, dpi=150, bbox_inches="tight")
+        print(f"\nSaved visualization to: {output_path}")
+        plt.show()
 
 
 # %%

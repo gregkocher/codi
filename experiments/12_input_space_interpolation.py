@@ -4,6 +4,7 @@
 # ABOUTME: similarity to find monotonic patterns in the latent reasoning space.
 
 # %%
+import importlib
 import json
 import sys
 from pathlib import Path
@@ -14,12 +15,20 @@ import numpy as np
 import torch
 from dotenv import load_dotenv
 from sklearn.manifold import TSNE
-from transformers.cache_utils import DynamicCache
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
+sys.path.insert(0, str(Path(__file__).parent))
 
 from src.datasets import extract_answer_number
 from src.model import CODI
+
+# Import shared utilities from experiment 3
+_exp3 = importlib.import_module("3_logit_lens_latents")
+get_lm_head = _exp3.get_lm_head
+get_layer_norm = _exp3.get_layer_norm
+logit_lens = _exp3.logit_lens
+prepare_inputs = _exp3.prepare_inputs
+ensure_tokenizer_special_tokens = _exp3.ensure_tokenizer_special_tokens
 
 # %%
 # Parameters
@@ -48,80 +57,6 @@ DEFAULT_TEMPLATE = (
 
 
 # ============================================================================
-# Model Utilities (shared with experiments 10/11)
-# ============================================================================
-
-
-def get_lm_head(model):
-    return model.codi.get_base_model().lm_head
-
-
-def get_layer_norm(model):
-    return model.codi.get_base_model().model.norm
-
-
-def logit_lens(hidden_states, lm_head, layer_norm, top_k=5, layer_indices=None):
-    """
-    Apply logit lens to hidden states for a single (batch=1) forward pass.
-    Returns a list of dicts, one per analyzed layer.
-    """
-    if layer_indices is None:
-        indices_to_use = range(len(hidden_states))
-    else:
-        indices_to_use = layer_indices
-
-    results = []
-    for layer_idx in indices_to_use:
-        h = hidden_states[layer_idx]
-        h_last = h[:, -1, :]  # (1, hidden)
-        h_last = layer_norm(h_last)
-        logits = lm_head(h_last)  # (1, vocab)
-        probs = torch.softmax(logits, dim=-1)
-        top_probs, top_indices = torch.topk(probs, top_k, dim=-1)
-
-        results.append(
-            {
-                "layer": layer_idx,
-                "top_indices": top_indices[0].cpu().tolist(),
-                "top_probs": top_probs[0].cpu().tolist(),
-            }
-        )
-
-    return results
-
-
-def prepare_inputs(model, tokenizer, prompt):
-    """Construct input sequence: [Prompt Tokens] + [EOS] + [BOCOT]"""
-    device = model.codi.device
-
-    inputs = tokenizer(
-        prompt, return_tensors="pt", padding=False, add_special_tokens=True
-    )
-    input_ids = inputs["input_ids"].to(device)
-    attention_mask = inputs["attention_mask"].to(device)
-
-    sot_id = tokenizer.convert_tokens_to_ids("<|bocot|>")
-    eos_id = tokenizer.eos_token_id
-
-    bot_tensor = torch.tensor([[eos_id, sot_id]], dtype=torch.long, device=device)
-    input_ids_bot = torch.cat([input_ids, bot_tensor], dim=1)
-    attention_mask_bot = torch.cat(
-        [attention_mask, torch.ones_like(bot_tensor)], dim=1
-    )
-
-    return input_ids_bot, attention_mask_bot
-
-
-def ensure_tokenizer_special_tokens(tokenizer) -> None:
-    if tokenizer.pad_token_id is None:
-        tokenizer.add_special_tokens({"pad_token": "[PAD]"})
-        tokenizer.pad_token_id = tokenizer.convert_tokens_to_ids("[PAD]")
-    tokenizer.add_special_tokens(
-        {"additional_special_tokens": ["<|bocot|>", "<|eocot|>"]}
-    )
-
-
-# ============================================================================
 # Collect latent vectors + logit lens + answer from a single prompt
 # ============================================================================
 
@@ -140,10 +75,16 @@ def run_full_pass(
     """
     Run a single prompt through prefill + K latent iterations + answer generation.
 
+    Indexing matches the original repo (experiment 3):
+      - latent_logit_lens[0] = "Prompt" (prefill hidden states, last token = <|bocot|>)
+      - latent_logit_lens[1..K] = "Latent 0" .. "Latent K-1" (loop iterations)
+      - latent_vectors[0] = initial embedding from prefill
+      - latent_vectors[1..K] = outputs from each latent iteration
+
     Returns:
         dict with:
           - latent_vectors: list of K+1 tensors (1, 1, hidden_dim), detached on CPU
-          - latent_logit_lens: list of K+1 logit lens results per latent position
+          - latent_logit_lens: list of K+1 logit lens results (Prompt + K latent)
           - generated_text: decoded answer string
           - generated_tokens: list of token ids
     """
@@ -168,19 +109,21 @@ def run_full_pass(
         )
         past_kv = outputs.past_key_values
 
-        # Initial latent embedding (position 0) — extracted from prefill
-        # NOTE: no logit lens here; prefill hidden states reflect <|bocot|>
-        # token prediction (always <|eocot|>), not the thought vector content.
+        # Initial latent embedding — extracted from prefill
         latent_embd = outputs.hidden_states[-1][:, -1, :].unsqueeze(1)
         if model.use_prj:
             latent_embd = model.prj(latent_embd).to(dtype=model.codi.dtype)
 
         latent_vectors.append(latent_embd.detach().cpu().clone())
 
+        # Logit lens on prefill output (matches experiment 3 "Prompt" column)
+        lens_result = logit_lens(
+            outputs.hidden_states, lm_head, layer_norm,
+            top_k=top_k_tokens, layer_indices=logit_lens_layers,
+        )
+        latent_logit_lens.append({"position": "Prompt", "logit_lens": lens_result})
+
         # ---- Latent iterations ----
-        # Each iteration feeds vector i and produces vector i+1.
-        # The logit lens at iteration i captures the model's internal state
-        # while processing vector i — labelled "position i".
         for i in range(num_latent_iterations):
             outputs = model.codi(
                 inputs_embeds=latent_embd,
@@ -190,42 +133,19 @@ def run_full_pass(
             )
             past_kv = outputs.past_key_values
 
-            # Logit lens for vector i (the vector we just fed in)
-            lens_result = logit_lens(
-                outputs.hidden_states, lm_head, layer_norm,
-                top_k=top_k_tokens, layer_indices=logit_lens_layers,
-            )
-            latent_logit_lens.append(
-                {"position": i, "logit_lens": lens_result}
-            )
-
-            # Extract vector i+1
             latent_embd = outputs.hidden_states[-1][:, -1, :].unsqueeze(1)
             if model.use_prj:
                 latent_embd = model.prj(latent_embd).to(dtype=model.codi.dtype)
 
             latent_vectors.append(latent_embd.detach().cpu().clone())
 
-        # ---- Logit lens for the final vector (position K) ----
-        # Clone KV cache so this extra forward pass doesn't affect answer gen.
-        cloned_kv = DynamicCache()
-        for layer_idx in range(len(past_kv)):
-            key, value = past_kv[layer_idx]
-            cloned_kv.update(key.clone(), value.clone(), layer_idx)
-
-        outputs_final = model.codi(
-            inputs_embeds=latent_embd,
-            use_cache=True,
-            output_hidden_states=True,
-            past_key_values=cloned_kv,
-        )
-        lens_result = logit_lens(
-            outputs_final.hidden_states, lm_head, layer_norm,
-            top_k=top_k_tokens, layer_indices=logit_lens_layers,
-        )
-        latent_logit_lens.append(
-            {"position": num_latent_iterations, "logit_lens": lens_result}
-        )
+            lens_result = logit_lens(
+                outputs.hidden_states, lm_head, layer_norm,
+                top_k=top_k_tokens, layer_indices=logit_lens_layers,
+            )
+            latent_logit_lens.append(
+                {"position": f"Latent {i}", "logit_lens": lens_result}
+            )
 
         # ---- Generate answer tokens ----
         eot_id = tokenizer.convert_tokens_to_ids("<|eocot|>")
@@ -351,8 +271,12 @@ def compute_drift_from_first(all_vectors, x_values):
 # ============================================================================
 
 
-def visualize_answer_vs_x(all_results, x_values, results_dir):
-    """Plot model's numerical answer vs input X, with ground truth line y = 12 + X."""
+def visualize_answer_vs_x(all_results, x_values, base_number, results_dir):
+    """Plot model's numerical answer vs input X, with ground truth line."""
+    # Use evenly-spaced indices so large X values don't distort the axis
+    indices = list(range(len(x_values)))
+    x_labels = [str(x) for x in x_values]
+
     answers = []
     for x in x_values:
         a = all_results[x].get("answer")
@@ -361,23 +285,23 @@ def visualize_answer_vs_x(all_results, x_values, results_dir):
         else:
             answers.append(float("nan"))
 
-    ground_truths = [12 + x for x in x_values]
+    ground_truths = [base_number + x for x in x_values]
 
-    fig, ax = plt.subplots(figsize=(12, 5))
+    fig, ax = plt.subplots(figsize=(max(12, len(x_values) * 0.5), 5))
 
-    ax.plot(x_values, answers, "o-", color="dodgerblue", markersize=8, linewidth=2,
+    ax.plot(indices, answers, "o-", color="dodgerblue", markersize=8, linewidth=2,
             label="Model answer", zorder=3)
-    ax.plot(x_values, ground_truths, "s--", color="green", markersize=6,
-            linewidth=1.5, label="Ground truth (12 + X)", alpha=0.7)
+    ax.plot(indices, ground_truths, "s--", color="green", markersize=6,
+            linewidth=1.5, label=f"Ground truth ({base_number} + X)", alpha=0.7)
 
     # Annotate each point
-    for x, y, r_x in zip(x_values, answers, x_values):
+    for idx, (x, y) in enumerate(zip(x_values, answers)):
         if not np.isnan(y):
-            text = all_results[r_x].get("generated_text", "")[:8]
+            text = all_results[x].get("generated_text", "")[:12]
             ax.annotate(
-                text, (x, y),
+                text, (idx, y),
                 textcoords="offset points", xytext=(0, 12),
-                ha="center", fontsize=7, color="gray",
+                ha="center", fontsize=6, color="gray", rotation=45,
             )
 
     ax.set_xlabel("X (number added)", fontsize=13, fontweight="bold")
@@ -385,7 +309,8 @@ def visualize_answer_vs_x(all_results, x_values, results_dir):
     ax.set_title("Model Answer vs Input Number X", fontsize=15, fontweight="bold")
     ax.legend(fontsize=10)
     ax.grid(True, alpha=0.3)
-    ax.set_xticks(x_values)
+    ax.set_xticks(indices)
+    ax.set_xticklabels(x_labels, fontsize=7, rotation=45, ha="right")
 
     plt.tight_layout()
     path = results_dir / "answer_vs_x.png"
@@ -472,7 +397,8 @@ def visualize_cosine_similarity_matrices(cos_matrices, x_values, results_dir):
         im = ax.imshow(mat, cmap="RdYlGn", aspect="equal", vmin=0.9, vmax=1.0)
         plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
 
-        ax.set_title(f"Latent Position {pos}", fontsize=11)
+        label = "Prompt" if pos == 0 else f"Latent {pos - 1}"
+        ax.set_title(label, fontsize=11)
         ax.set_xlabel("X", fontsize=9)
         ax.set_ylabel("X", fontsize=9)
 
@@ -502,17 +428,21 @@ def visualize_drift_from_first(drift, x_values, results_dir):
     Line plot: for each latent position, how does cosine similarity to X_min
     change as X increases? Tests monotonic drift.
     """
-    fig, ax = plt.subplots(figsize=(12, 5))
+    indices = list(range(len(x_values)))
+    x_labels = [str(x) for x in x_values]
+
+    fig, ax = plt.subplots(figsize=(max(12, len(x_values) * 0.5), 5))
 
     cmap = plt.cm.viridis
     num_positions = len(drift)
     colors = [cmap(i / max(1, num_positions - 1)) for i in range(num_positions)]
 
     for pos in range(num_positions):
+        label = "Prompt" if pos == 0 else f"Latent {pos - 1}"
         ax.plot(
-            x_values, drift[pos], "o-",
+            indices, drift[pos], "o-",
             color=colors[pos], markersize=5, linewidth=1.5,
-            label=f"Position {pos}",
+            label=label,
         )
 
     ax.set_xlabel("X (input number)", fontsize=13, fontweight="bold")
@@ -523,7 +453,8 @@ def visualize_drift_from_first(drift, x_values, results_dir):
     )
     ax.legend(fontsize=9, loc="lower left")
     ax.grid(True, alpha=0.3)
-    ax.set_xticks(x_values)
+    ax.set_xticks(indices)
+    ax.set_xticklabels(x_labels, fontsize=7, rotation=45, ha="right")
 
     plt.tight_layout()
     path = results_dir / "drift_from_first.png"
@@ -537,29 +468,36 @@ def visualize_consecutive_cosine_sims(consec_sims, x_values, results_dir):
     Line plot: cosine similarity between consecutive X values for each
     latent position. Flat = smooth latent space, dips = phase transitions.
     """
-    fig, ax = plt.subplots(figsize=(12, 5))
+    # Labels for midpoints between consecutive pairs
+    midpoint_labels = [
+        f"{x_values[i]}-{x_values[i + 1]}" for i in range(len(x_values) - 1)
+    ]
+    indices = list(range(len(midpoint_labels)))
+
+    fig, ax = plt.subplots(figsize=(max(12, len(indices) * 0.5), 5))
 
     cmap = plt.cm.viridis
     num_positions = len(consec_sims)
     colors = [cmap(i / max(1, num_positions - 1)) for i in range(num_positions)]
 
-    x_midpoints = [(x_values[i] + x_values[i + 1]) / 2 for i in range(len(x_values) - 1)]
-
     for pos in range(num_positions):
+        label = "Prompt" if pos == 0 else f"Latent {pos - 1}"
         ax.plot(
-            x_midpoints, consec_sims[pos], "o-",
+            indices, consec_sims[pos], "o-",
             color=colors[pos], markersize=5, linewidth=1.5,
-            label=f"Position {pos}",
+            label=label,
         )
 
-    ax.set_xlabel("X (midpoint between consecutive inputs)", fontsize=13, fontweight="bold")
-    ax.set_ylabel("Cosine similarity (X, X+1)", fontsize=13, fontweight="bold")
+    ax.set_xlabel("Consecutive X pair", fontsize=13, fontweight="bold")
+    ax.set_ylabel("Cosine similarity (X_i, X_{i+1})", fontsize=13, fontweight="bold")
     ax.set_title(
         "Consecutive Cosine Similarity Between Adjacent Inputs",
         fontsize=15, fontweight="bold",
     )
     ax.legend(fontsize=9)
     ax.grid(True, alpha=0.3)
+    ax.set_xticks(indices)
+    ax.set_xticklabels(midpoint_labels, fontsize=6, rotation=45, ha="right")
 
     plt.tight_layout()
     path = results_dir / "consecutive_cosine_similarity.png"
@@ -609,6 +547,7 @@ def visualize_tsne(all_vectors, x_values, results_dir, perplexity=5, seed=42):
         mask = labels_position == pos
         idxs = np.where(mask)[0]
         color = cmap(pos % 10)
+        label = "Prompt" if pos == 0 else f"Latent {pos - 1}"
 
         # Draw connecting lines (in order of X)
         ax.plot(
@@ -619,7 +558,7 @@ def visualize_tsne(all_vectors, x_values, results_dir, perplexity=5, seed=42):
         # Draw points
         ax.scatter(
             embeddings[idxs, 0], embeddings[idxs, 1],
-            c=[color], s=50, label=f"Pos {pos}", zorder=2, edgecolors="white",
+            c=[color], s=50, label=label, zorder=2, edgecolors="white",
             linewidth=0.5,
         )
 
@@ -697,9 +636,11 @@ def visualize_vector_norms(all_vectors, x_values, results_dir):
     Plot L2 norms of latent vectors across X values for each position.
     Checks whether vector magnitude changes systematically with X.
     """
+    indices = list(range(len(x_values)))
+    x_labels = [str(x) for x in x_values]
     num_positions = len(all_vectors[x_values[0]])
 
-    fig, ax = plt.subplots(figsize=(12, 5))
+    fig, ax = plt.subplots(figsize=(max(12, len(x_values) * 0.5), 5))
 
     cmap = plt.cm.viridis
     colors = [cmap(i / max(1, num_positions - 1)) for i in range(num_positions)]
@@ -709,10 +650,11 @@ def visualize_vector_norms(all_vectors, x_values, results_dir):
         for x in x_values:
             v = all_vectors[x][pos].flatten().float()
             norms.append(v.norm().item())
+        label = "Prompt" if pos == 0 else f"Latent {pos - 1}"
         ax.plot(
-            x_values, norms, "o-",
+            indices, norms, "o-",
             color=colors[pos], markersize=5, linewidth=1.5,
-            label=f"Position {pos}",
+            label=label,
         )
 
     ax.set_xlabel("X (input number)", fontsize=13, fontweight="bold")
@@ -723,7 +665,8 @@ def visualize_vector_norms(all_vectors, x_values, results_dir):
     )
     ax.legend(fontsize=9)
     ax.grid(True, alpha=0.3)
-    ax.set_xticks(x_values)
+    ax.set_xticks(indices)
+    ax.set_xticklabels(x_labels, fontsize=7, rotation=45, ha="right")
 
     plt.tight_layout()
     path = results_dir / "vector_norms.png"
@@ -738,8 +681,8 @@ def print_summary_table(all_results, x_values, tokenizer, base_number):
 
     header = f"{'X':>5s} | {'GT':>5s}"
     for p_idx in range(num_positions):
-        pos_label = all_results[x_values[0]]["latent_logit_lens"][p_idx]["position"]
-        header += f" | {'Lat ' + str(pos_label):>12s}"
+        pos_label = str(all_results[x_values[0]]["latent_logit_lens"][p_idx]["position"])
+        header += f" | {pos_label:>12s}"
     header += f" | {'Answer':>12s}"
     print("=" * len(header))
     print(header)
@@ -767,11 +710,15 @@ def print_summary_table(all_results, x_values, tokenizer, base_number):
 # ============================================================================
 
 
+EXTRA_X_VALUES = [25, 30, 50, 100, 500, 1000, 1999, 2026, 5000, 100000]
+
+
 def main(
     template: str = DEFAULT_TEMPLATE,
     x_start: int = 2,
     x_end: int = 20,
     base_number: int = 12,
+    extra_x: list[int] | None = EXTRA_X_VALUES,
     num_latent_iterations: int = NUM_LATENT_ITERATIONS,
     seed: int = 42,
     top_k: int = 10,
@@ -788,6 +735,7 @@ def main(
         x_start: Starting value for X (inclusive).
         x_end: Ending value for X (inclusive).
         base_number: The base number in the problem (for ground truth = base + X).
+        extra_x: Additional X values to append after the range (e.g. [25, 50, 100]).
         num_latent_iterations: Number of latent reasoning steps (K).
         seed: Random seed.
         top_k: Top-K tokens for logit lens.
@@ -798,7 +746,16 @@ def main(
     load_dotenv()
 
     x_values = list(range(x_start, x_end + 1))
-    results_dir = RESULTS_DIR / f"x{x_start}_to_{x_end}"
+    if extra_x:
+        # Append extra values, skip any already in the range
+        existing = set(x_values)
+        for v in extra_x:
+            if v not in existing:
+                x_values.append(v)
+                existing.add(v)
+
+    x_max_label = x_values[-1] if extra_x else x_end
+    results_dir = RESULTS_DIR / f"x{x_start}_to_{x_max_label}"
     results_dir.mkdir(parents=True, exist_ok=True)
 
     # Model setup
@@ -834,7 +791,9 @@ def main(
 
     # Config
     print(f"\nTemplate: {template}")
-    print(f"X range: {x_start} to {x_end} ({len(x_values)} prompts)")
+    print(f"X values: {x_values[0]}..{x_values[-1]} ({len(x_values)} prompts)")
+    if extra_x:
+        print(f"  (includes extra: {[v for v in x_values if v > x_end]})")
     print(f"Base number: {base_number}")
     print(f"Num latent iterations: {num_latent_iterations}")
     print(f"Logit lens layers: {logit_lens_layers or 'all'}")
@@ -939,7 +898,7 @@ def main(
 
     # ---- Visualizations ----
     print("\nCreating visualizations...")
-    visualize_answer_vs_x(all_results, x_values, results_dir)
+    visualize_answer_vs_x(all_results, x_values, base_number, results_dir)
     visualize_logit_lens_heatmap(all_results, x_values, tokenizer, results_dir)
     visualize_cosine_similarity_matrices(cos_matrices, x_values, results_dir)
     visualize_drift_from_first(drift, x_values, results_dir)

@@ -4,6 +4,7 @@
 # ABOUTME: starting point to see how answers transition.
 
 # %%
+import importlib
 import json
 import sys
 from pathlib import Path
@@ -16,10 +17,19 @@ from dotenv import load_dotenv
 from transformers.cache_utils import DynamicCache
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
+sys.path.insert(0, str(Path(__file__).parent))
 
 from src.datasets import extract_answer_number
 from src.interpolation import lerp, slerp
 from src.model import CODI
+
+# Import shared utilities from experiment 3
+_exp3 = importlib.import_module("3_logit_lens_latents")
+get_lm_head = _exp3.get_lm_head
+get_layer_norm = _exp3.get_layer_norm
+logit_lens = _exp3.logit_lens
+prepare_inputs = _exp3.prepare_inputs
+ensure_tokenizer_special_tokens = _exp3.ensure_tokenizer_special_tokens
 
 # %%
 # Parameters
@@ -73,81 +83,6 @@ PROMPT_PAIRS = {
         "ground_truth2": 4,
     },
 }
-
-
-# ============================================================================
-# Model Utilities (same as experiment 10)
-# ============================================================================
-
-
-def get_lm_head(model):
-    return model.codi.get_base_model().lm_head
-
-
-def get_layer_norm(model):
-    return model.codi.get_base_model().model.norm
-
-
-def logit_lens(hidden_states, lm_head, layer_norm, top_k=5, layer_indices=None):
-    """
-    Apply logit lens to hidden states for a single (batch=1) forward pass.
-
-    Returns a list of dicts, one per analyzed layer.
-    """
-    if layer_indices is None:
-        indices_to_use = range(len(hidden_states))
-    else:
-        indices_to_use = layer_indices
-
-    results = []
-    for layer_idx in indices_to_use:
-        h = hidden_states[layer_idx]
-        h_last = h[:, -1, :]  # (1, hidden)
-        h_last = layer_norm(h_last)
-        logits = lm_head(h_last)  # (1, vocab)
-        probs = torch.softmax(logits, dim=-1)
-        top_probs, top_indices = torch.topk(probs, top_k, dim=-1)
-
-        results.append(
-            {
-                "layer": layer_idx,
-                "top_indices": top_indices[0].cpu().tolist(),
-                "top_probs": top_probs[0].cpu().tolist(),
-            }
-        )
-
-    return results
-
-
-def prepare_inputs(model, tokenizer, prompt):
-    """Construct input sequence: [Prompt Tokens] + [EOS] + [BOCOT]"""
-    device = model.codi.device
-
-    inputs = tokenizer(
-        prompt, return_tensors="pt", padding=False, add_special_tokens=True
-    )
-    input_ids = inputs["input_ids"].to(device)
-    attention_mask = inputs["attention_mask"].to(device)
-
-    sot_id = tokenizer.convert_tokens_to_ids("<|bocot|>")
-    eos_id = tokenizer.eos_token_id
-
-    bot_tensor = torch.tensor([[eos_id, sot_id]], dtype=torch.long, device=device)
-    input_ids_bot = torch.cat([input_ids, bot_tensor], dim=1)
-    attention_mask_bot = torch.cat(
-        [attention_mask, torch.ones_like(bot_tensor)], dim=1
-    )
-
-    return input_ids_bot, attention_mask_bot
-
-
-def ensure_tokenizer_special_tokens(tokenizer) -> None:
-    if tokenizer.pad_token_id is None:
-        tokenizer.add_special_tokens({"pad_token": "[PAD]"})
-        tokenizer.pad_token_id = tokenizer.convert_tokens_to_ids("[PAD]")
-    tokenizer.add_special_tokens(
-        {"additional_special_tokens": ["<|bocot|>", "<|eocot|>"]}
-    )
 
 
 # ============================================================================
