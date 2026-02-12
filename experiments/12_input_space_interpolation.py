@@ -23,6 +23,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from src.datasets import extract_answer_number
 from src.model import CODI
+from src.templates import ADDITION_FIRST_TEMPLATES, SUBTRACTION_FIRST_TEMPLATES
 
 # Import shared utilities from experiment 3
 _exp3 = importlib.import_module("3_logit_lens_latents")
@@ -50,12 +51,133 @@ NUM_LATENT_ITERATIONS = 6
 
 RESULTS_DIR = Path(__file__).parent.parent / "results" / "input_space_interpolation"
 
-# Default prompt template: {X} is replaced with the varying number
-DEFAULT_TEMPLATE = (
-    "A shop has 12 items. They receive {X} more items. "
-    "How many items does the shop have now? "
-    "Give the answer only and nothing else."
-)
+
+# ============================================================================
+# Preset prompt configurations
+# ============================================================================
+
+# The addition/subtraction templates use {X}, {Y}, {Z} as variable names.
+# In our presets we pick one to sweep (replaced with {X} in the final template)
+# and fix the others.
+
+PRESETS = {
+    "simple_add": {
+        "description": "Simple addition: base + X",
+        "template": (
+            "A shop has 12 items. They receive {X} more items. "
+            "How many items does the shop have now? "
+            "Give the answer only and nothing else."
+        ),
+        "gt_formula": "12 + X",
+        "default_fixed_vars": {"base": 12},
+        "default_sweep_var": "X",
+        "default_x_start": 2,
+        "default_x_end": 20,
+        "default_extra_x": [25, 30, 50, 100, 500, 1000, 1999, 2026, 5000, 100000],
+    },
+    "addition": {
+        "description": "Addition template: (A+B)*(C+1), sweep one of A/B/C",
+        "raw_template": ADDITION_FIRST_TEMPLATES[0],  # uses {X}, {Y}, {Z}
+        "gt_formula": "(A+B)*(C+1)",
+        "default_fixed_vars": {"A": 3, "C": 2},
+        "default_sweep_var": "B",
+        "default_x_start": 1,
+        "default_x_end": 8,
+        "default_extra_x": None,
+    },
+    "subtraction": {
+        "description": "Subtraction template: (A-B)*(C+1), sweep A (starting members)",
+        "raw_template": SUBTRACTION_FIRST_TEMPLATES[0],  # uses {X}, {Y}, {Z}
+        "gt_formula": "(A-B)*(C+1)",
+        "default_fixed_vars": {"B": 2, "C": 2},
+        "default_sweep_var": "A",
+        "default_x_start": 3,
+        "default_x_end": 20,
+        "default_extra_x": [25, 30, 50, 100, 500, 1000, 5000, 10000],
+    },
+}
+
+# Map from our sweep variable names (A, B, C) to the template placeholders ({X}, {Y}, {Z})
+_SWEEP_TO_TEMPLATE_VAR = {"A": "X", "B": "Y", "C": "Z"}
+
+
+def build_template_from_preset(preset_name: str, sweep_var: str, fixed_vars: dict) -> str:
+    """
+    Build a prompt template string with {X} as the only remaining placeholder.
+
+    For 'simple_add', returns the template as-is.
+    For 'addition'/'subtraction', takes the raw 3-variable template, substitutes
+    the fixed variables with their values, and renames the swept variable to {X}.
+    """
+    preset = PRESETS[preset_name]
+
+    if preset_name == "simple_add":
+        return preset["template"]
+
+    raw = preset["raw_template"]
+    # The raw template uses {X}, {Y}, {Z} (the repo's convention).
+    # Our variables are A, B, C which map to X, Y, Z respectively.
+    # First, substitute the fixed variables.
+    for var_name, value in fixed_vars.items():
+        tpl_var = _SWEEP_TO_TEMPLATE_VAR[var_name]
+        raw = raw.replace("{" + tpl_var + "}", str(value))
+
+    # Now rename the swept variable's placeholder to {X} (our sweep placeholder)
+    swept_tpl_var = _SWEEP_TO_TEMPLATE_VAR[sweep_var]
+    raw = raw.replace("{" + swept_tpl_var + "}", "{X}")
+
+    return raw
+
+
+def compute_ground_truth(x: int, preset_name: str, sweep_var: str, fixed_vars: dict) -> int:
+    """
+    Compute the ground truth answer for a given X value and preset.
+
+    Args:
+        x: The swept variable's value.
+        preset_name: One of 'simple_add', 'addition', 'subtraction'.
+        sweep_var: Which variable is being swept ('A', 'B', or 'C').
+        fixed_vars: Dict of fixed variable values (e.g. {'A': 3, 'C': 2}).
+
+    Returns:
+        Integer ground truth answer.
+    """
+    if preset_name == "simple_add":
+        return fixed_vars.get("base", 12) + x
+
+    # Resolve A, B, C values
+    var_values = dict(fixed_vars)
+    var_values[sweep_var] = x
+    a, b, c = var_values["A"], var_values["B"], var_values["C"]
+
+    if preset_name == "addition":
+        step_1 = a + b
+    elif preset_name == "subtraction":
+        step_1 = a - b
+    else:
+        raise ValueError(f"Unknown preset: {preset_name}")
+
+    return step_1 * c + step_1  # = step_1 * (c + 1)
+
+
+def gt_label(preset_name: str, sweep_var: str, fixed_vars: dict) -> str:
+    """Return a human-readable label for the ground truth formula."""
+    if preset_name == "simple_add":
+        base = fixed_vars.get("base", 12)
+        return f"{base} + X"
+
+    var_strs = {}
+    for v in ("A", "B", "C"):
+        if v == sweep_var:
+            var_strs[v] = "X"
+        else:
+            var_strs[v] = str(fixed_vars[v])
+
+    if preset_name == "addition":
+        return f"({var_strs['A']}+{var_strs['B']})*({var_strs['C']}+1)"
+    elif preset_name == "subtraction":
+        return f"({var_strs['A']}-{var_strs['B']})*({var_strs['C']}+1)"
+    return "?"
 
 
 # ============================================================================
@@ -77,16 +199,16 @@ def run_full_pass(
     """
     Run a single prompt through prefill + K latent iterations + answer generation.
 
-    Indexing matches the original repo (experiment 3):
-      - latent_logit_lens[0] = "Prompt" (prefill hidden states, last token = <|bocot|>)
-      - latent_logit_lens[1..K] = "Latent 0" .. "Latent K-1" (loop iterations)
+    Indexing:
+      - latent_logit_lens[0] = "Latent 0" (prefill hidden states, last token = <|bocot|>)
+      - latent_logit_lens[1..K] = "Latent 1" .. "Latent K" (loop iterations)
       - latent_vectors[0] = initial embedding from prefill
       - latent_vectors[1..K] = outputs from each latent iteration
 
     Returns:
         dict with:
           - latent_vectors: list of K+1 tensors (1, 1, hidden_dim), detached on CPU
-          - latent_logit_lens: list of K+1 logit lens results (Prompt + K latent)
+          - latent_logit_lens: list of K+1 logit lens results (Latent 0 .. Latent K)
           - generated_text: decoded answer string
           - generated_tokens: list of token ids
     """
@@ -118,12 +240,12 @@ def run_full_pass(
 
         latent_vectors.append(latent_embd.detach().cpu().clone())
 
-        # Logit lens on prefill output (matches experiment 3 "Prompt" column)
+        # Logit lens on prefill output (latent vector 0)
         lens_result = logit_lens(
             outputs.hidden_states, lm_head, layer_norm,
             top_k=top_k_tokens, layer_indices=logit_lens_layers,
         )
-        latent_logit_lens.append({"position": "Prompt", "logit_lens": lens_result})
+        latent_logit_lens.append({"position": "Latent 0", "logit_lens": lens_result})
 
         # ---- Latent iterations ----
         for i in range(num_latent_iterations):
@@ -146,7 +268,7 @@ def run_full_pass(
                 top_k=top_k_tokens, layer_indices=logit_lens_layers,
             )
             latent_logit_lens.append(
-                {"position": f"Latent {i}", "logit_lens": lens_result}
+                {"position": f"Latent {i + 1}", "logit_lens": lens_result}
             )
 
         # ---- Generate answer tokens ----
@@ -273,7 +395,7 @@ def compute_drift_from_first(all_vectors, x_values):
 # ============================================================================
 
 
-def visualize_answer_vs_x(all_results, x_values, base_number, results_dir):
+def visualize_answer_vs_x(all_results, x_values, gt_label_str, results_dir):
     """Plot model's numerical answer vs input X, with ground truth line."""
     # Use evenly-spaced indices so large X values don't distort the axis
     indices = list(range(len(x_values)))
@@ -287,14 +409,14 @@ def visualize_answer_vs_x(all_results, x_values, base_number, results_dir):
         else:
             answers.append(float("nan"))
 
-    ground_truths = [base_number + x for x in x_values]
+    ground_truths = [all_results[x]["ground_truth"] for x in x_values]
 
     fig, ax = plt.subplots(figsize=(max(12, len(x_values) * 0.5), 5))
 
     ax.plot(indices, answers, "o-", color="dodgerblue", markersize=8, linewidth=2,
             label="Model answer", zorder=3)
     ax.plot(indices, ground_truths, "s--", color="green", markersize=6,
-            linewidth=1.5, label=f"Ground truth ({base_number} + X)", alpha=0.7)
+            linewidth=1.5, label=f"Ground truth ({gt_label_str})", alpha=0.7)
 
     # Annotate each point
     for idx, (x, y) in enumerate(zip(x_values, answers)):
@@ -507,17 +629,17 @@ def visualize_cosine_similarity_matrices(cos_matrices, x_values, results_dir):
         im = ax.imshow(mat, cmap="RdYlGn", aspect="equal", vmin=0.9, vmax=1.0)
         plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
 
-        label = "Prompt" if pos == 0 else f"Latent {pos - 1}"
+        label = f"Latent {pos}"
         ax.set_title(label, fontsize=11)
         ax.set_xlabel("X", fontsize=9)
         ax.set_ylabel("X", fontsize=9)
 
-        tick_positions = list(range(0, len(x_values), max(1, len(x_values) // 8)))
-        tick_labels = [str(x_values[i]) for i in tick_positions]
-        ax.set_xticks(tick_positions)
-        ax.set_xticklabels(tick_labels, fontsize=7)
-        ax.set_yticks(tick_positions)
-        ax.set_yticklabels(tick_labels, fontsize=7)
+        all_ticks = list(range(len(x_values)))
+        all_labels = [str(x) for x in x_values]
+        ax.set_xticks(all_ticks)
+        ax.set_xticklabels(all_labels, fontsize=6, rotation=45, ha="right")
+        ax.set_yticks(all_ticks)
+        ax.set_yticklabels(all_labels, fontsize=6)
 
     for idx in range(num_positions, rows * cols):
         axes[idx // cols][idx % cols].axis("off")
@@ -548,7 +670,7 @@ def visualize_drift_from_first(drift, x_values, results_dir):
     colors = [cmap(i / max(1, num_positions - 1)) for i in range(num_positions)]
 
     for pos in range(num_positions):
-        label = "Prompt" if pos == 0 else f"Latent {pos - 1}"
+        label = f"Latent {pos}"
         ax.plot(
             indices, drift[pos], "o-",
             color=colors[pos], markersize=5, linewidth=1.5,
@@ -591,7 +713,7 @@ def visualize_consecutive_cosine_sims(consec_sims, x_values, results_dir):
     colors = [cmap(i / max(1, num_positions - 1)) for i in range(num_positions)]
 
     for pos in range(num_positions):
-        label = "Prompt" if pos == 0 else f"Latent {pos - 1}"
+        label = f"Latent {pos}"
         ax.plot(
             indices, consec_sims[pos], "o-",
             color=colors[pos], markersize=5, linewidth=1.5,
@@ -653,7 +775,7 @@ def _plot_embeddings_by_position(
         mask = labels_position == pos
         idxs = np.where(mask)[0]
         color = cmap(pos % 10)
-        label = "Prompt" if pos == 0 else f"Latent {pos - 1}"
+        label = f"Latent {pos}"
 
         ax.plot(
             embeddings[idxs, 0], embeddings[idxs, 1],
@@ -812,7 +934,7 @@ def visualize_vector_norms(all_vectors, x_values, results_dir):
         for x in x_values:
             v = all_vectors[x][pos].flatten().float()
             norms.append(v.norm().item())
-        label = "Prompt" if pos == 0 else f"Latent {pos - 1}"
+        label = f"Latent {pos}"
         ax.plot(
             indices, norms, "o-",
             color=colors[pos], markersize=5, linewidth=1.5,
@@ -837,10 +959,10 @@ def visualize_vector_norms(all_vectors, x_values, results_dir):
     print(f"Saved: {path}")
 
 
-def visualize_token_crystallization_depth(all_results, x_values, tokenizer, results_dir):
+def visualize_token_first_occurrence_depth(all_results, x_values, tokenizer, results_dir):
     """
     Heatmap showing the earliest layer at which the top-1 token matches the
-    final layer's top-1 token and never changes again (crystallization depth).
+    final layer's top-1 token and never changes again (first occurrence depth).
     Rows = X values, columns = latent vector index.
     """
     num_x = len(x_values)
@@ -856,27 +978,27 @@ def visualize_token_crystallization_depth(all_results, x_values, tokenizer, resu
 
             # Scan backwards to find the earliest layer that matches the final
             # token and all subsequent layers also match.
-            crystal_layer = num_layers - 1  # worst case: only final layer
+            first_layer = num_layers - 1  # worst case: only final layer
             for li in range(num_layers - 1, -1, -1):
                 if layers_data[li]["top_indices"][0] == final_token:
-                    crystal_layer = li
+                    first_layer = li
                 else:
                     break  # the streak is broken
 
-            depth_matrix[row_idx, p_idx] = layers_data[crystal_layer]["layer"]
+            depth_matrix[row_idx, p_idx] = layers_data[first_layer]["layer"]
 
     fig, ax = plt.subplots(
         figsize=(3 + num_positions * 1.8, 2 + num_x * 0.55)
     )
 
-    im = ax.imshow(depth_matrix, cmap="viridis_r", aspect="auto")
+    im = ax.imshow(depth_matrix, cmap="coolwarm", aspect="auto")
     cbar = plt.colorbar(im, ax=ax)
-    cbar.set_label("Crystallization layer", rotation=270, labelpad=15, fontsize=12)
+    cbar.set_label("First occurrence layer", rotation=270, labelpad=15, fontsize=12)
 
     for i in range(num_x):
         for j in range(num_positions):
             val = int(depth_matrix[i, j])
-            text_color = "white" if val < depth_matrix.max() * 0.6 else "black"
+            text_color = "black"
             ax.text(
                 j, i, str(val),
                 ha="center", va="center", color=text_color, fontsize=8,
@@ -889,12 +1011,12 @@ def visualize_token_crystallization_depth(all_results, x_values, tokenizer, resu
     ax.set_yticks(range(num_x))
     ax.set_yticklabels([str(x) for x in x_values], fontsize=10)
     ax.set_title(
-        "Token Crystallization Depth (earliest layer matching final top-1 token)",
+        "Token 1st Occurrence Depth (earliest layer matching final top-1 token)",
         fontsize=13, fontweight="bold", pad=12,
     )
 
     plt.tight_layout()
-    path = results_dir / "token_crystallization_depth.png"
+    path = results_dir / "token_first_occurrence_depth.png"
     fig.savefig(path, dpi=200, bbox_inches="tight", facecolor="white")
     plt.close(fig)
     print(f"Saved: {path}")
@@ -927,7 +1049,7 @@ def visualize_layer_entropy(all_results, x_values, results_dir):
         figsize=(3 + num_positions * 1.8, 2 + num_layers * 0.45)
     )
 
-    im = ax.imshow(entropy_mean, cmap="inferno", aspect="auto")
+    im = ax.imshow(entropy_mean, cmap="coolwarm", aspect="auto")
     cbar = plt.colorbar(im, ax=ax)
     cbar.set_label("Mean entropy (bits, top-K)", rotation=270, labelpad=15, fontsize=11)
 
@@ -980,7 +1102,7 @@ def visualize_token_stability_across_layers(all_results, x_values, results_dir):
     colors = [cmap(i / max(1, num_positions - 1)) for i in range(num_positions)]
 
     for pos in range(num_positions):
-        label = f"Vec {pos}"
+        label = f"Latent {pos}"
         ax.plot(
             range(num_layers), stability[:, pos], "o-",
             color=colors[pos], markersize=4, linewidth=1.5,
@@ -1006,7 +1128,7 @@ def visualize_token_stability_across_layers(all_results, x_values, results_dir):
     print(f"Saved: {path}")
 
 
-def print_summary_table(all_results, x_values, tokenizer, base_number):
+def print_summary_table(all_results, x_values, tokenizer):
     """Print a console summary: X, answer, top-1 token at each latent position."""
     num_positions = len(all_results[x_values[0]]["latent_logit_lens"])
 
@@ -1021,7 +1143,7 @@ def print_summary_table(all_results, x_values, tokenizer, base_number):
 
     for x in x_values:
         r = all_results[x]
-        gt = base_number + x
+        gt = r["ground_truth"]
         answer_str = r.get("generated_text", "")[:12]
         row = f"{x:>5d} | {gt:>5d}"
         for pos_data in r["latent_logit_lens"]:
@@ -1041,15 +1163,14 @@ def print_summary_table(all_results, x_values, tokenizer, base_number):
 # ============================================================================
 
 
-EXTRA_X_VALUES = [25, 30, 50, 100, 500, 1000, 1999, 2026, 5000, 100000]
-
-
 def main(
-    template: str = DEFAULT_TEMPLATE,
-    x_start: int = 2,
-    x_end: int = 20,
-    base_number: int = 12,
-    extra_x: list[int] | None = EXTRA_X_VALUES,
+    preset: str = "simple_add",
+    sweep_var: str | None = None,
+    fixed_vars: dict | None = None,
+    template: str | None = None,
+    x_start: int | None = None,
+    x_end: int | None = None,
+    extra_x: list[int] | None = "default",
     num_latent_iterations: int = NUM_LATENT_ITERATIONS,
     seed: int = 42,
     top_k: int = 10,
@@ -1062,11 +1183,16 @@ def main(
     run each variant through CODI, and analyze how latent vectors change.
 
     Args:
-        template: Prompt template with {X} placeholder.
-        x_start: Starting value for X (inclusive).
-        x_end: Ending value for X (inclusive).
-        base_number: The base number in the problem (for ground truth = base + X).
-        extra_x: Additional X values to append after the range (e.g. [25, 50, 100]).
+        preset: Prompt preset ('simple_add', 'addition', 'subtraction').
+        sweep_var: Which variable to sweep. Defaults per preset
+            (simple_add: 'X', addition/subtraction: 'B').
+        fixed_vars: Fixed variable values (e.g. {'A': 3, 'C': 2}).
+            Defaults per preset.
+        template: Override prompt template with {X} placeholder (ignores preset).
+        x_start: Starting value for X (inclusive). Defaults per preset.
+        x_end: Ending value for X (inclusive). Defaults per preset.
+        extra_x: Additional X values to append after the range. Use 'default'
+            for preset default, None for no extras.
         num_latent_iterations: Number of latent reasoning steps (K).
         seed: Random seed.
         top_k: Top-K tokens for logit lens.
@@ -1076,9 +1202,32 @@ def main(
     """
     load_dotenv()
 
+    # ---- Resolve preset defaults ----
+    assert preset in PRESETS, f"Unknown preset: {preset}. Choose from {list(PRESETS.keys())}"
+    p = PRESETS[preset]
+
+    if sweep_var is None:
+        sweep_var = p["default_sweep_var"]
+    if fixed_vars is None:
+        fixed_vars = dict(p["default_fixed_vars"])
+    else:
+        fixed_vars = dict(fixed_vars)  # copy
+    if x_start is None:
+        x_start = p["default_x_start"]
+    if x_end is None:
+        x_end = p["default_x_end"]
+    if extra_x == "default":
+        extra_x = p["default_extra_x"]
+
+    # Build the template (user override takes priority)
+    if template is None:
+        template = build_template_from_preset(preset, sweep_var, fixed_vars)
+
+    # Build the ground truth label
+    gt_label_str = gt_label(preset, sweep_var, fixed_vars)
+
     x_values = list(range(x_start, x_end + 1))
     if extra_x:
-        # Append extra values, skip any already in the range
         existing = set(x_values)
         for v in extra_x:
             if v not in existing:
@@ -1086,7 +1235,7 @@ def main(
                 existing.add(v)
 
     x_max_label = x_values[-1] if extra_x else x_end
-    results_dir = RESULTS_DIR / f"x{x_start}_to_{x_max_label}"
+    results_dir = RESULTS_DIR / f"{preset}_x{x_start}_to_{x_max_label}"
     results_dir.mkdir(parents=True, exist_ok=True)
 
     # Model setup
@@ -1121,11 +1270,13 @@ def main(
         resolved_layers = None
 
     # Config
-    print(f"\nTemplate: {template}")
+    print(f"\nPreset: {preset} — {p['description']}")
+    print(f"Template: {template}")
+    print(f"Sweep var: {sweep_var}, Fixed vars: {fixed_vars}")
+    print(f"GT formula: {gt_label_str}")
     print(f"X values: {x_values[0]}..{x_values[-1]} ({len(x_values)} prompts)")
     if extra_x:
         print(f"  (includes extra: {[v for v in x_values if v > x_end]})")
-    print(f"Base number: {base_number}")
     print(f"Num latent iterations: {num_latent_iterations}")
     print(f"Logit lens layers: {logit_lens_layers or 'all'}")
 
@@ -1135,8 +1286,8 @@ def main(
 
     for x in x_values:
         prompt = template.replace("{X}", str(x))
-        ground_truth = base_number + x
-        print(f"\n  X={x:>2d}  prompt: {prompt[:60]}...")
+        ground_truth = compute_ground_truth(x, preset, sweep_var, fixed_vars)
+        print(f"\n  X={x}  prompt: {prompt[:60]}...")
 
         result = run_full_pass(
             model=model,
@@ -1171,7 +1322,7 @@ def main(
 
     # ---- Summary ----
     print("\n")
-    print_summary_table(all_results, x_values, tokenizer, base_number)
+    print_summary_table(all_results, x_values, tokenizer)
 
     num_correct = sum(1 for x in x_values if all_results[x]["correct"])
     print(f"\nCorrect: {num_correct}/{len(x_values)}")
@@ -1189,10 +1340,13 @@ def main(
     # ---- Save JSON ----
     json_results = {
         "config": {
+            "preset": preset,
+            "sweep_var": sweep_var,
+            "fixed_vars": fixed_vars,
+            "gt_formula": gt_label_str,
             "template": template,
             "x_start": x_start,
             "x_end": x_end,
-            "base_number": base_number,
             "num_latent_iterations": num_latent_iterations,
             "seed": seed,
             "logit_lens_layers": logit_lens_layers,
@@ -1229,7 +1383,7 @@ def main(
 
     # ---- Visualizations ----
     print("\nCreating visualizations...")
-    visualize_answer_vs_x(all_results, x_values, base_number, results_dir)
+    visualize_answer_vs_x(all_results, x_values, gt_label_str, results_dir)
     visualize_logit_lens_heatmap(all_results, x_values, tokenizer, results_dir)
     visualize_logit_lens_heatmap_top5(all_results, x_values, tokenizer, results_dir)
     visualize_cosine_similarity_matrices(cos_matrices, x_values, results_dir)
@@ -1252,7 +1406,7 @@ def main(
 
     # ---- Cross-layer analysis ----
     print("\nCross-layer analysis...")
-    visualize_token_crystallization_depth(
+    visualize_token_first_occurrence_depth(
         all_results, x_values, tokenizer, results_dir,
     )
     visualize_layer_entropy(all_results, x_values, results_dir)

@@ -426,7 +426,7 @@ def visualize_logit_lens_grid(results, tokenizer, results_dir):
         alpha_val = r["alpha"]
         answer_str = r.get("generated_text", "")[:12]
         ax.set_title(f"α={alpha_val:.2f}  ans={answer_str}", fontsize=10)
-        ax.set_xlabel("Latent Pos", fontsize=9)
+        ax.set_xlabel("Latent Vector Index", fontsize=9)
         ax.set_ylabel("Layer", fontsize=9)
         ax.set_xticks(range(num_positions))
         pos_labels = [str(d["position"]) for d in r["latent_logit_lens"]]
@@ -485,7 +485,7 @@ def visualize_top1_comparison(results, tokenizer, results_dir):
             )
 
     alphas = [r["alpha"] for r in results]
-    ax.set_xlabel("Latent Position", fontsize=13, fontweight="bold")
+    ax.set_xlabel("Latent Vector Index", fontsize=13, fontweight="bold")
     ax.set_ylabel("Alpha", fontsize=13, fontweight="bold")
     ax.set_xticks(range(num_positions))
     pos_labels = [str(d["position"]) for d in results[0]["latent_logit_lens"]]

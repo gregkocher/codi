@@ -330,7 +330,7 @@ def visualize_rollout_comparison(
                 ha="center", va="center", color=text_color, fontsize=11,
             )
 
-    ax.set_xlabel("Latent Position", fontsize=14, fontweight="bold")
+    ax.set_xlabel("Latent Vector Index", fontsize=14, fontweight="bold")
     ax.set_ylabel("Rollout", fontsize=14, fontweight="bold")
     ax.set_xticks(range(num_latent_positions))
     ax.set_xticklabels([str(i) for i in range(num_latent_positions)], fontsize=11)
@@ -406,7 +406,7 @@ def visualize_full_logit_lens_grid(
             f"Rollout {r_idx} ({correct_str}: {rollout.get('generated_text', '')[:20]})",
             fontsize=10,
         )
-        ax.set_xlabel("Latent Pos", fontsize=9)
+        ax.set_xlabel("Latent Vector Index", fontsize=9)
         ax.set_ylabel("Layer", fontsize=9)
         ax.set_xticks(range(num_positions))
         ax.set_xticklabels([str(i) for i in range(num_positions)], fontsize=8)
