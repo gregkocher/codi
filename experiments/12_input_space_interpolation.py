@@ -321,13 +321,22 @@ def visualize_answer_vs_x(all_results, x_values, base_number, results_dir):
     print(f"Saved: {path}")
 
 
-def visualize_logit_lens_heatmap(all_results, x_values, tokenizer, results_dir):
+def visualize_logit_lens_heatmap(
+    all_results, x_values, tokenizer, results_dir, layer_index=None,
+):
     """
     Heatmap: rows = X values, columns = latent vector index (0..K).
-    Each cell shows top-1 token from the final analyzed layer.
+    Each cell shows top-1 token from a specific layer's logit lens.
+
+    Args:
+        layer_index: Index into the logit_lens list for each position.
+            None (default) = last layer (-1).
     """
     num_x = len(x_values)
     num_positions = len(all_results[x_values[0]]["latent_logit_lens"])
+
+    # Determine which layer entry to use
+    li = -1 if layer_index is None else layer_index
 
     token_matrix = []
     prob_matrix = np.zeros((num_x, num_positions))
@@ -335,9 +344,9 @@ def visualize_logit_lens_heatmap(all_results, x_values, tokenizer, results_dir):
     for row_idx, x in enumerate(x_values):
         row_tokens = []
         for p_idx, pos_data in enumerate(all_results[x]["latent_logit_lens"]):
-            final_layer = pos_data["logit_lens"][-1]
-            top_token_id = final_layer["top_indices"][0]
-            top_prob = final_layer["top_probs"][0]
+            layer_data = pos_data["logit_lens"][li]
+            top_token_id = layer_data["top_indices"][0]
+            top_prob = layer_data["top_probs"][0]
             token_str = tokenizer.decode([top_token_id])
             row_tokens.append(token_str)
             prob_matrix[row_idx, p_idx] = top_prob
@@ -362,32 +371,50 @@ def visualize_logit_lens_heatmap(all_results, x_values, tokenizer, results_dir):
                 ha="center", va="center", color=text_color, fontsize=8,
             )
 
+    # Resolve actual layer number for title/filename
+    actual_layer = (
+        all_results[x_values[0]]["latent_logit_lens"][0]["logit_lens"][li]["layer"]
+    )
+
     ax.set_xlabel("Latent Vector Index", fontsize=13, fontweight="bold")
     ax.set_ylabel("X (input number)", fontsize=13, fontweight="bold")
     ax.set_xticks(range(num_positions))
     ax.set_xticklabels([str(i) for i in range(num_positions)], fontsize=10)
     ax.set_yticks(range(num_x))
     ax.set_yticklabels([str(x) for x in x_values], fontsize=10)
-    ax.set_title(
-        "Top-1 Logit Lens Token (Final Layer) vs Input X",
-        fontsize=14, fontweight="bold", pad=12,
-    )
+
+    if layer_index is None:
+        title = "Top-1 Logit Lens Token (Final Layer) vs Input X"
+        filename = "logit_lens_heatmap.png"
+    else:
+        title = f"Top-1 Logit Lens Token (Layer {actual_layer}) vs Input X"
+        filename = f"logit_lens_heatmap_layer_{actual_layer}.png"
+
+    ax.set_title(title, fontsize=14, fontweight="bold", pad=12)
 
     plt.tight_layout()
-    path = results_dir / "logit_lens_heatmap.png"
+    path = results_dir / filename
     fig.savefig(path, dpi=200, bbox_inches="tight", facecolor="white")
     plt.close(fig)
     print(f"Saved: {path}")
 
 
-def visualize_logit_lens_heatmap_top5(all_results, x_values, tokenizer, results_dir):
+def visualize_logit_lens_heatmap_top5(
+    all_results, x_values, tokenizer, results_dir, layer_index=None,
+):
     """
     Heatmap: rows = X values, columns = latent vector index (0..K).
     Each cell shows the top-1 token prominently and tokens 2-5 in smaller
     font below in parentheses.
+
+    Args:
+        layer_index: Index into the logit_lens list for each position.
+            None (default) = last layer (-1).
     """
     num_x = len(x_values)
     num_positions = len(all_results[x_values[0]]["latent_logit_lens"])
+
+    li = -1 if layer_index is None else layer_index
 
     # Collect top-5 tokens and top-1 probability per cell
     top5_matrix = []  # [row][col] = list of 5 token strings
@@ -396,14 +423,19 @@ def visualize_logit_lens_heatmap_top5(all_results, x_values, tokenizer, results_
     for row_idx, x in enumerate(x_values):
         row_top5 = []
         for p_idx, pos_data in enumerate(all_results[x]["latent_logit_lens"]):
-            final_layer = pos_data["logit_lens"][-1]
+            layer_data = pos_data["logit_lens"][li]
             tokens_5 = []
-            for k in range(min(5, len(final_layer["top_indices"]))):
-                tid = final_layer["top_indices"][k]
+            for k in range(min(5, len(layer_data["top_indices"]))):
+                tid = layer_data["top_indices"][k]
                 tokens_5.append(tokenizer.decode([tid]))
             row_top5.append(tokens_5)
-            prob_matrix[row_idx, p_idx] = final_layer["top_probs"][0]
+            prob_matrix[row_idx, p_idx] = layer_data["top_probs"][0]
         top5_matrix.append(row_top5)
+
+    # Resolve actual layer number for title/filename
+    actual_layer = (
+        all_results[x_values[0]]["latent_logit_lens"][0]["logit_lens"][li]["layer"]
+    )
 
     # Taller rows to accommodate the extra text
     fig, ax = plt.subplots(
@@ -443,13 +475,18 @@ def visualize_logit_lens_heatmap_top5(all_results, x_values, tokenizer, results_
     ax.set_xticklabels([str(i) for i in range(num_positions)], fontsize=10)
     ax.set_yticks(range(num_x))
     ax.set_yticklabels([str(x) for x in x_values], fontsize=10)
-    ax.set_title(
-        "Top-5 Logit Lens Tokens (Final Layer) vs Input X",
-        fontsize=14, fontweight="bold", pad=12,
-    )
+
+    if layer_index is None:
+        title = "Top-5 Logit Lens Tokens (Final Layer) vs Input X"
+        filename = "logit_lens_heatmap_top5.png"
+    else:
+        title = f"Top-5 Logit Lens Tokens (Layer {actual_layer}) vs Input X"
+        filename = f"logit_lens_heatmap_top5_layer_{actual_layer}.png"
+
+    ax.set_title(title, fontsize=14, fontweight="bold", pad=12)
 
     plt.tight_layout()
-    path = results_dir / "logit_lens_heatmap_top5.png"
+    path = results_dir / filename
     fig.savefig(path, dpi=200, bbox_inches="tight", facecolor="white")
     plt.close(fig)
     print(f"Saved: {path}")
@@ -800,6 +837,175 @@ def visualize_vector_norms(all_vectors, x_values, results_dir):
     print(f"Saved: {path}")
 
 
+def visualize_token_crystallization_depth(all_results, x_values, tokenizer, results_dir):
+    """
+    Heatmap showing the earliest layer at which the top-1 token matches the
+    final layer's top-1 token and never changes again (crystallization depth).
+    Rows = X values, columns = latent vector index.
+    """
+    num_x = len(x_values)
+    num_positions = len(all_results[x_values[0]]["latent_logit_lens"])
+
+    depth_matrix = np.zeros((num_x, num_positions))
+
+    for row_idx, x in enumerate(x_values):
+        for p_idx, pos_data in enumerate(all_results[x]["latent_logit_lens"]):
+            layers_data = pos_data["logit_lens"]
+            num_layers = len(layers_data)
+            final_token = layers_data[-1]["top_indices"][0]
+
+            # Scan backwards to find the earliest layer that matches the final
+            # token and all subsequent layers also match.
+            crystal_layer = num_layers - 1  # worst case: only final layer
+            for li in range(num_layers - 1, -1, -1):
+                if layers_data[li]["top_indices"][0] == final_token:
+                    crystal_layer = li
+                else:
+                    break  # the streak is broken
+
+            depth_matrix[row_idx, p_idx] = layers_data[crystal_layer]["layer"]
+
+    fig, ax = plt.subplots(
+        figsize=(3 + num_positions * 1.8, 2 + num_x * 0.55)
+    )
+
+    im = ax.imshow(depth_matrix, cmap="viridis_r", aspect="auto")
+    cbar = plt.colorbar(im, ax=ax)
+    cbar.set_label("Crystallization layer", rotation=270, labelpad=15, fontsize=12)
+
+    for i in range(num_x):
+        for j in range(num_positions):
+            val = int(depth_matrix[i, j])
+            text_color = "white" if val < depth_matrix.max() * 0.6 else "black"
+            ax.text(
+                j, i, str(val),
+                ha="center", va="center", color=text_color, fontsize=8,
+            )
+
+    ax.set_xlabel("Latent Vector Index", fontsize=13, fontweight="bold")
+    ax.set_ylabel("X (input number)", fontsize=13, fontweight="bold")
+    ax.set_xticks(range(num_positions))
+    ax.set_xticklabels([str(i) for i in range(num_positions)], fontsize=10)
+    ax.set_yticks(range(num_x))
+    ax.set_yticklabels([str(x) for x in x_values], fontsize=10)
+    ax.set_title(
+        "Token Crystallization Depth (earliest layer matching final top-1 token)",
+        fontsize=13, fontweight="bold", pad=12,
+    )
+
+    plt.tight_layout()
+    path = results_dir / "token_crystallization_depth.png"
+    fig.savefig(path, dpi=200, bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+    print(f"Saved: {path}")
+
+
+def visualize_layer_entropy(all_results, x_values, results_dir):
+    """
+    Heatmap: rows = layers, columns = latent vector index.
+    Each cell = mean entropy (over top-K probs) across all X values.
+    """
+    num_positions = len(all_results[x_values[0]]["latent_logit_lens"])
+    sample_lens = all_results[x_values[0]]["latent_logit_lens"][0]["logit_lens"]
+    num_layers = len(sample_lens)
+    layer_numbers = [ld["layer"] for ld in sample_lens]
+
+    # Accumulate entropy per (layer, position)
+    entropy_sums = np.zeros((num_layers, num_positions))
+
+    for x in x_values:
+        for p_idx, pos_data in enumerate(all_results[x]["latent_logit_lens"]):
+            for li, layer_data in enumerate(pos_data["logit_lens"]):
+                probs = np.array(layer_data["top_probs"], dtype=np.float64)
+                probs = probs[probs > 0]  # avoid log(0)
+                entropy = -np.sum(probs * np.log2(probs))
+                entropy_sums[li, p_idx] += entropy
+
+    entropy_mean = entropy_sums / len(x_values)
+
+    fig, ax = plt.subplots(
+        figsize=(3 + num_positions * 1.8, 2 + num_layers * 0.45)
+    )
+
+    im = ax.imshow(entropy_mean, cmap="inferno", aspect="auto")
+    cbar = plt.colorbar(im, ax=ax)
+    cbar.set_label("Mean entropy (bits, top-K)", rotation=270, labelpad=15, fontsize=11)
+
+    ax.set_xlabel("Latent Vector Index", fontsize=13, fontweight="bold")
+    ax.set_ylabel("Layer", fontsize=13, fontweight="bold")
+    ax.set_xticks(range(num_positions))
+    ax.set_xticklabels([str(i) for i in range(num_positions)], fontsize=10)
+    ax.set_yticks(range(num_layers))
+    ax.set_yticklabels([str(l) for l in layer_numbers], fontsize=9)
+    ax.set_title(
+        "Layer-wise Mean Entropy of Logit Lens (across X values)",
+        fontsize=13, fontweight="bold", pad=12,
+    )
+
+    plt.tight_layout()
+    path = results_dir / "layer_entropy_heatmap.png"
+    fig.savefig(path, dpi=200, bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+    print(f"Saved: {path}")
+
+
+def visualize_token_stability_across_layers(all_results, x_values, results_dir):
+    """
+    Line chart: for each latent position, what fraction of X values have the
+    same top-1 token as the final layer, at each layer depth?
+    """
+    num_positions = len(all_results[x_values[0]]["latent_logit_lens"])
+    sample_lens = all_results[x_values[0]]["latent_logit_lens"][0]["logit_lens"]
+    num_layers = len(sample_lens)
+    layer_numbers = [ld["layer"] for ld in sample_lens]
+    num_x = len(x_values)
+
+    # stability_matrix[li][pos] = fraction of X values matching final top-1
+    stability = np.zeros((num_layers, num_positions))
+
+    for p_idx in range(num_positions):
+        for li in range(num_layers):
+            match_count = 0
+            for x in x_values:
+                lens_data = all_results[x]["latent_logit_lens"][p_idx]["logit_lens"]
+                final_token = lens_data[-1]["top_indices"][0]
+                layer_token = lens_data[li]["top_indices"][0]
+                if layer_token == final_token:
+                    match_count += 1
+            stability[li, p_idx] = match_count / num_x
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    cmap = plt.cm.coolwarm
+    colors = [cmap(i / max(1, num_positions - 1)) for i in range(num_positions)]
+
+    for pos in range(num_positions):
+        label = f"Vec {pos}"
+        ax.plot(
+            range(num_layers), stability[:, pos], "o-",
+            color=colors[pos], markersize=4, linewidth=1.5,
+            label=label,
+        )
+
+    ax.set_xlabel("Layer", fontsize=13, fontweight="bold")
+    ax.set_ylabel("Fraction matching final-layer top-1", fontsize=13, fontweight="bold")
+    ax.set_title(
+        "Top-1 Token Stability Across Layers",
+        fontsize=15, fontweight="bold",
+    )
+    ax.set_xticks(range(num_layers))
+    ax.set_xticklabels([str(l) for l in layer_numbers], fontsize=9)
+    ax.set_ylim(-0.05, 1.05)
+    ax.legend(fontsize=8, ncol=2, loc="lower right")
+    ax.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    path = results_dir / "token_stability_across_layers.png"
+    fig.savefig(path, dpi=200, bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+    print(f"Saved: {path}")
+
+
 def print_summary_table(all_results, x_values, tokenizer, base_number):
     """Print a console summary: X, answer, top-1 token at each latent position."""
     num_positions = len(all_results[x_values[0]]["latent_logit_lens"])
@@ -1030,6 +1236,29 @@ def main(
     visualize_drift_from_first(drift, x_values, results_dir)
     visualize_consecutive_cosine_sims(consec_sims, x_values, results_dir)
     visualize_vector_norms(all_vectors, x_values, results_dir)
+
+    # ---- Per-layer logit lens heatmaps ----
+    num_ll_layers = len(
+        all_results[x_values[0]]["latent_logit_lens"][0]["logit_lens"]
+    )
+    print(f"\nGenerating per-layer logit lens heatmaps ({num_ll_layers} layers)...")
+    for li in range(num_ll_layers):
+        visualize_logit_lens_heatmap(
+            all_results, x_values, tokenizer, results_dir, layer_index=li,
+        )
+        visualize_logit_lens_heatmap_top5(
+            all_results, x_values, tokenizer, results_dir, layer_index=li,
+        )
+
+    # ---- Cross-layer analysis ----
+    print("\nCross-layer analysis...")
+    visualize_token_crystallization_depth(
+        all_results, x_values, tokenizer, results_dir,
+    )
+    visualize_layer_entropy(all_results, x_values, results_dir)
+    visualize_token_stability_across_layers(
+        all_results, x_values, results_dir,
+    )
 
     print("Running t-SNE...")
     visualize_tsne(all_vectors, x_values, results_dir,
