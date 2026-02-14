@@ -1,6 +1,7 @@
 # ABOUTME: Noisy latent rollout experiment with logit lens analysis (batched).
 # ABOUTME: Runs N rollouts on the same prompt in a single batched forward pass,
 # ABOUTME: with norm-preserving noise at specified latent positions.
+# ABOUTME: Collects latent vectors and uses shared analysis/viz from exp_utils.
 
 # %%
 import importlib
@@ -30,12 +31,38 @@ logit_lens = _exp3.logit_lens
 prepare_inputs = _exp3.prepare_inputs
 ensure_tokenizer_special_tokens = _exp3.ensure_tokenizer_special_tokens
 
+# Import shared analysis / visualization utilities
+from exp_utils import (
+    compute_consecutive_cosine_sims,
+    compute_cosine_similarity_matrices,
+    compute_drift_from_first,
+    visualize_consecutive_cosine_sims,
+    visualize_cosine_similarity_matrices,
+    visualize_drift_from_first,
+    visualize_full_logit_lens_grid,
+    visualize_layer_entropy,
+    visualize_logit_lens_heatmap,
+    visualize_logit_lens_heatmap_top5,
+    visualize_token_first_occurrence_depth,
+    visualize_token_stability_across_layers,
+    visualize_tsne,
+    visualize_umap,
+    visualize_vector_norms,
+    visualize_within_series_cosine_similarity,
+)
+
 # %%
 # Parameters
 CHECKPOINT_PATH = "bcywinski/codi_llama1b-answer_only"
 MODEL_NAME_OR_PATH = "meta-llama/Llama-3.2-1B-Instruct"
 
-DEVICE = "cuda"
+if torch.cuda.is_available():
+    DEVICE = "cuda"
+elif torch.backends.mps.is_available():
+    DEVICE = "mps"
+else:
+    DEVICE = "cpu"
+
 DTYPE = "bfloat16"
 
 NUM_LATENT_ITERATIONS = 6
@@ -94,7 +121,7 @@ def add_per_element_noise(tensor, noise_scale, generators):
 
 
 # ============================================================================
-# Batched Rollouts with Noise + Logit Lens
+# Batched Rollouts with Noise + Logit Lens + Latent Vectors
 # ============================================================================
 
 
@@ -121,13 +148,18 @@ def run_batched_noisy_rollouts(
     latent iterations and answer generation as batch_size=N. Each rollout gets
     different noise via its own torch.Generator seeded with base_seed + rollout_idx.
 
-    Args:
-        logit_lens_layers: Optional list of layer indices for logit lens analysis.
-            None = all layers. E.g. [-4,-3,-2,-1] for last 4 layers only.
+    Indexing (matches experiment 12):
+      - latent_logit_lens[0] = "Latent 0" (prefill hidden states — shared)
+      - latent_logit_lens[1..K] = "Latent 1" .. "Latent K" (per-rollout)
+      - latent_vectors[0] = initial embedding after projection + noise
+      - latent_vectors[1..K] = outputs from each latent iteration after projection + noise
 
     Returns:
-        List of N dicts, each with generated_text, generated_tokens, and
-        per-latent-step logit lens results.
+        List of N dicts, each with:
+          - generated_text: decoded answer string
+          - generated_tokens: list of token ids
+          - latent_logit_lens: list of K+1 dicts (Latent 0..K)
+          - latent_vectors: list of K+1 tensors (1, 1, hidden_dim) on CPU
     """
     device = model.codi.device
     N = num_rollouts
@@ -163,6 +195,7 @@ def run_batched_noisy_rollouts(
     pad_id = tokenizer.pad_token_id or 0
 
     all_latent_logit_lens = [[] for _ in range(N)]
+    all_latent_vectors = [[] for _ in range(N)]
 
     with torch.no_grad():
         # ----- Step 1: Prefill once (batch_size=1) -----
@@ -173,6 +206,16 @@ def run_batched_noisy_rollouts(
             past_key_values=None,
             attention_mask=attention_mask,
         )
+
+        # Logit lens on prefill output — "Latent 0" (shared across all rollouts)
+        prefill_lens_result = logit_lens(
+            outputs.hidden_states, lm_head, layer_norm,
+            top_k=top_k_tokens, layer_indices=resolved_layers,
+        )
+        for b in range(N):
+            all_latent_logit_lens[b].append(
+                {"position": "Latent 0", "logit_lens": prefill_lens_result}
+            )
 
         # ----- Step 2: Expand KV cache to batch_size=N -----
         past_kv = expand_kv_cache(outputs.past_key_values, N)
@@ -189,6 +232,12 @@ def run_batched_noisy_rollouts(
         if noise_positions is not None and 0 in noise_positions:
             latent_embd = add_per_element_noise(
                 latent_embd, noise_scale, generators
+            )
+
+        # Store Latent 0 vector for each rollout
+        for b in range(N):
+            all_latent_vectors[b].append(
+                latent_embd[b : b + 1].detach().cpu().clone()
             )
 
         # ----- Step 3: Latent iterations (batched) -----
@@ -209,7 +258,7 @@ def run_batched_noisy_rollouts(
                     top_k=top_k_tokens, layer_indices=resolved_layers,
                 )
                 all_latent_logit_lens[b].append(
-                    {"position": i, "logit_lens": lens_result}
+                    {"position": f"Latent {i + 1}", "logit_lens": lens_result}
                 )
 
             # Next latent embedding
@@ -222,6 +271,12 @@ def run_batched_noisy_rollouts(
             if noise_positions is not None and (i + 1) in noise_positions:
                 latent_embd = add_per_element_noise(
                     latent_embd, noise_scale, generators
+                )
+
+            # Store latent vector for each rollout
+            for b in range(N):
+                all_latent_vectors[b].append(
+                    latent_embd[b : b + 1].detach().cpu().clone()
                 )
 
         # ----- Step 4: Generate answer tokens (batched) -----
@@ -274,6 +329,7 @@ def run_batched_noisy_rollouts(
                 "generated_text": text,
                 "generated_tokens": generated_tokens[b],
                 "latent_logit_lens": all_latent_logit_lens[b],
+                "latent_vectors": all_latent_vectors[b],
             }
         )
 
@@ -281,147 +337,8 @@ def run_batched_noisy_rollouts(
 
 
 # ============================================================================
-# Visualization
+# Experiment-10-specific helpers
 # ============================================================================
-
-
-def visualize_rollout_comparison(
-    all_rollout_results, tokenizer, results_dir
-):
-    """
-    Create a grid visualization: rows = rollouts, columns = latent positions.
-    Each cell shows the top-1 token from the final analyzed layer's logit lens.
-    """
-    num_rollouts = len(all_rollout_results)
-    num_latent_positions = len(all_rollout_results[0]["latent_logit_lens"])
-
-    # Build matrix of top-1 tokens at the final analyzed layer
-    token_matrix = []
-    prob_matrix = np.zeros((num_rollouts, num_latent_positions))
-
-    for r_idx, rollout in enumerate(all_rollout_results):
-        row_tokens = []
-        for p_idx, pos_data in enumerate(rollout["latent_logit_lens"]):
-            # Get the last analyzed layer's top-1 token
-            final_layer = pos_data["logit_lens"][-1]
-            top_token_id = final_layer["top_indices"][0]
-            top_prob = final_layer["top_probs"][0]
-            token_str = tokenizer.decode([top_token_id])
-            row_tokens.append(token_str)
-            prob_matrix[r_idx, p_idx] = top_prob
-        token_matrix.append(row_tokens)
-
-    # Create figure
-    fig, ax = plt.subplots(figsize=(3 + num_latent_positions * 1.8, 2 + num_rollouts * 0.7))
-
-    im = ax.imshow(prob_matrix, cmap="YlOrRd", aspect="auto", vmin=0, vmax=1)
-    cbar = plt.colorbar(im, ax=ax)
-    cbar.set_label("Top-1 probability", rotation=270, labelpad=15, fontsize=12)
-
-    # Annotate cells with token text
-    for i in range(num_rollouts):
-        for j in range(num_latent_positions):
-            token = token_matrix[i][j]
-            prob = prob_matrix[i, j]
-            token_display = repr(token)[1:-1] if token else ""
-            text_color = "white" if prob > 0.5 else "black"
-            ax.text(
-                j, i, token_display,
-                ha="center", va="center", color=text_color, fontsize=11,
-            )
-
-    ax.set_xlabel("Latent Vector Index", fontsize=14, fontweight="bold")
-    ax.set_ylabel("Rollout", fontsize=14, fontweight="bold")
-    ax.set_xticks(range(num_latent_positions))
-    ax.set_xticklabels([str(i) for i in range(num_latent_positions)], fontsize=11)
-    ax.set_yticks(range(num_rollouts))
-    ax.set_yticklabels([str(i) for i in range(num_rollouts)], fontsize=11)
-    ax.set_title(
-        "Top-1 Logit Lens Token (Final Layer) Across Rollouts",
-        fontsize=16, fontweight="bold", pad=12,
-    )
-
-    plt.tight_layout()
-    output_path = results_dir / "logit_lens_comparison.png"
-    fig.savefig(output_path, dpi=200, bbox_inches="tight", facecolor="white")
-    plt.close(fig)
-    print(f"Saved: {output_path}")
-
-
-def visualize_full_logit_lens_grid(
-    all_rollout_results, tokenizer, results_dir
-):
-    """
-    Create a multi-panel figure: one heatmap per rollout showing
-    (analyzed_layer x latent_position) with top-1 token annotations.
-    """
-    num_rollouts = len(all_rollout_results)
-    num_positions = len(all_rollout_results[0]["latent_logit_lens"])
-
-    # Determine the set of analyzed layer indices from the first rollout
-    analyzed_layers = [
-        entry["layer"]
-        for entry in all_rollout_results[0]["latent_logit_lens"][0]["logit_lens"]
-    ]
-    num_analyzed = len(analyzed_layers)
-
-    cols = min(num_rollouts, 5)
-    rows = (num_rollouts + cols - 1) // cols
-    fig, axes = plt.subplots(
-        rows, cols,
-        figsize=(cols * 5, rows * 4),
-        squeeze=False,
-    )
-
-    for r_idx, rollout in enumerate(all_rollout_results):
-        ax = axes[r_idx // cols][r_idx % cols]
-
-        prob_matrix = np.zeros((num_analyzed, num_positions))
-        token_matrix = [[None] * num_positions for _ in range(num_analyzed)]
-
-        for p_idx, pos_data in enumerate(rollout["latent_logit_lens"]):
-            for row_idx, layer_data in enumerate(pos_data["logit_lens"]):
-                top_token_id = layer_data["top_indices"][0]
-                top_prob = layer_data["top_probs"][0]
-                prob_matrix[row_idx, p_idx] = top_prob
-                token_matrix[row_idx][p_idx] = tokenizer.decode([top_token_id])
-
-        im = ax.imshow(prob_matrix, cmap="YlOrRd", aspect="auto", vmin=0, vmax=1)
-
-        # Only annotate if small enough to be readable
-        if num_analyzed <= 20 and num_positions <= 10:
-            for i in range(num_analyzed):
-                for j in range(num_positions):
-                    token = token_matrix[i][j]
-                    prob = prob_matrix[i, j]
-                    token_display = repr(token)[1:-1] if token else ""
-                    text_color = "white" if prob > 0.5 else "black"
-                    ax.text(
-                        j, i, token_display,
-                        ha="center", va="center", color=text_color, fontsize=7,
-                    )
-
-        correct_str = "correct" if rollout.get("correct", False) else "wrong"
-        ax.set_title(
-            f"Rollout {r_idx} ({correct_str}: {rollout.get('generated_text', '')[:20]})",
-            fontsize=10,
-        )
-        ax.set_xlabel("Latent Vector Index", fontsize=9)
-        ax.set_ylabel("Layer", fontsize=9)
-        ax.set_xticks(range(num_positions))
-        ax.set_xticklabels([str(i) for i in range(num_positions)], fontsize=8)
-        ax.set_yticks(range(num_analyzed))
-        ax.set_yticklabels([str(l) for l in analyzed_layers], fontsize=8)
-
-    # Hide unused axes
-    for idx in range(num_rollouts, rows * cols):
-        axes[idx // cols][idx % cols].axis("off")
-
-    plt.tight_layout()
-    output_path = results_dir / "logit_lens_full_grid.png"
-    fig.savefig(output_path, dpi=200, bbox_inches="tight", facecolor="white")
-    plt.close(fig)
-    print(f"Saved: {output_path}")
 
 
 def print_summary_table(all_rollout_results, tokenizer):
@@ -430,7 +347,7 @@ def print_summary_table(all_rollout_results, tokenizer):
 
     header = f"{'Rollout':>8s}"
     for p in range(num_positions):
-        header += f" | {'Pos ' + str(p):>12s}"
+        header += f" | {'Latent ' + str(p):>12s}"
     header += f" | {'Answer':>12s} | {'Correct':>7s}"
     print("=" * len(header))
     print(header)
@@ -452,6 +369,42 @@ def print_summary_table(all_rollout_results, tokenizer):
     print("=" * len(header))
 
 
+def visualize_accuracy_fraction(all_rollout_results, results_dir):
+    """Bar chart showing the fraction of correct rollouts."""
+    num_rollouts = len(all_rollout_results)
+    num_correct = sum(1 for r in all_rollout_results if r.get("correct", False))
+    frac = num_correct / num_rollouts if num_rollouts > 0 else 0
+
+    fig, ax = plt.subplots(figsize=(5, 4))
+    bars = ax.bar(
+        ["Correct", "Incorrect"],
+        [num_correct, num_rollouts - num_correct],
+        color=["#4CAF50", "#F44336"],
+        edgecolor="black",
+        linewidth=0.5,
+    )
+
+    # Annotate bars
+    for bar, count in zip(bars, [num_correct, num_rollouts - num_correct]):
+        ax.text(
+            bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.3,
+            str(count), ha="center", va="bottom", fontsize=14, fontweight="bold",
+        )
+
+    ax.set_ylabel("Number of Rollouts", fontsize=13, fontweight="bold")
+    ax.set_title(
+        f"Accuracy: {num_correct}/{num_rollouts} ({frac:.0%})",
+        fontsize=15, fontweight="bold",
+    )
+    ax.set_ylim(0, num_rollouts + 1)
+
+    plt.tight_layout()
+    path = results_dir / "accuracy_fraction.png"
+    fig.savefig(path, dpi=200, bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+    print(f"Saved: {path}")
+
+
 # ============================================================================
 # Main
 # ============================================================================
@@ -469,6 +422,7 @@ def main(
     greedy: bool = True,
     max_new_tokens: int = 128,
     logit_lens_layers: list[int] | None = None,
+    tsne_perplexity: float = 5.0,
 ):
     """
     Run N noisy rollouts on a single prompt with logit lens analysis (batched).
@@ -491,6 +445,7 @@ def main(
         max_new_tokens: Maximum tokens to generate for the answer.
         logit_lens_layers: Layer indices for logit lens. None = all layers.
             E.g. [-4,-3,-2,-1] for last 4 layers only (big speedup).
+        tsne_perplexity: Perplexity for t-SNE.
     """
     load_dotenv()
 
@@ -577,7 +532,18 @@ def main(
     num_correct = sum(1 for r in all_rollout_results if r["correct"])
     print(f"\nAccuracy: {num_correct}/{num_rollouts} ({num_correct / num_rollouts:.1%})")
 
-    # Save results to JSON
+    # ---- Reshape data for shared utils ----
+    # Build dicts keyed by rollout index, matching experiment 12's data format
+    rollout_keys = list(range(num_rollouts))  # [0, 1, 2, ..., N-1]
+
+    all_results = {}   # rollout_idx -> result dict (with latent_logit_lens)
+    all_vectors = {}   # rollout_idx -> list of K+1 tensors
+
+    for r_idx, result in enumerate(all_rollout_results):
+        all_vectors[r_idx] = result.pop("latent_vectors")
+        all_results[r_idx] = result
+
+    # ---- Save JSON ----
     json_results = {
         "config": {
             "prompt": prompt,
@@ -600,7 +566,8 @@ def main(
         "rollouts": [],
     }
 
-    for r in all_rollout_results:
+    for r_idx in rollout_keys:
+        r = all_results[r_idx]
         rollout_data = {
             "rollout_idx": r["rollout_idx"],
             "seed": r["seed"],
@@ -616,10 +583,97 @@ def main(
         json.dump(json_results, f, indent=2, default=str)
     print(f"\nResults saved to {results_file}")
 
-    # Visualizations
+    # ---- Shared Visualizations (using exp_utils) ----
+    x_dn = "Rollout"  # x_display_name for all shared viz functions
+
     print("\nCreating visualizations...")
-    visualize_rollout_comparison(all_rollout_results, tokenizer, results_dir)
-    visualize_full_logit_lens_grid(all_rollout_results, tokenizer, results_dir)
+
+    # Logit lens heatmaps (rows = rollouts, cols = latent positions)
+    visualize_logit_lens_heatmap(
+        all_results, rollout_keys, tokenizer, results_dir, x_display_name=x_dn,
+    )
+    visualize_logit_lens_heatmap_top5(
+        all_results, rollout_keys, tokenizer, results_dir, x_display_name=x_dn,
+    )
+
+    # Full logit lens grid (one subplot per rollout)
+    visualize_full_logit_lens_grid(
+        all_results, rollout_keys, tokenizer, results_dir, x_display_name=x_dn,
+    )
+
+    # Accuracy fraction bar chart
+    visualize_accuracy_fraction(all_rollout_results, results_dir)
+
+    # Cosine similarity analysis
+    print("\nComputing cosine similarity matrices...")
+    cos_matrices = compute_cosine_similarity_matrices(all_vectors, rollout_keys)
+    visualize_cosine_similarity_matrices(
+        cos_matrices, rollout_keys, results_dir, x_display_name=x_dn,
+    )
+
+    print("Computing consecutive cosine similarities...")
+    consec_sims = compute_consecutive_cosine_sims(all_vectors, rollout_keys)
+    visualize_consecutive_cosine_sims(
+        consec_sims, rollout_keys, results_dir, x_display_name=x_dn,
+    )
+
+    print("Computing drift from first rollout...")
+    drift = compute_drift_from_first(all_vectors, rollout_keys)
+    visualize_drift_from_first(
+        drift, rollout_keys, results_dir, x_display_name=x_dn,
+    )
+
+    # Vector norms
+    visualize_vector_norms(
+        all_vectors, rollout_keys, results_dir, x_display_name=x_dn,
+    )
+
+    # Per-layer logit lens heatmaps
+    num_ll_layers = len(
+        all_results[0]["latent_logit_lens"][0]["logit_lens"]
+    )
+    print(f"\nGenerating per-layer logit lens heatmaps ({num_ll_layers} layers)...")
+    for li in range(num_ll_layers):
+        visualize_logit_lens_heatmap(
+            all_results, rollout_keys, tokenizer, results_dir,
+            x_display_name=x_dn, layer_index=li,
+        )
+        visualize_logit_lens_heatmap_top5(
+            all_results, rollout_keys, tokenizer, results_dir,
+            x_display_name=x_dn, layer_index=li,
+        )
+
+    # Cross-layer analysis
+    print("\nCross-layer analysis...")
+    visualize_token_first_occurrence_depth(
+        all_results, rollout_keys, tokenizer, results_dir,
+        x_display_name=x_dn,
+    )
+    visualize_layer_entropy(
+        all_results, rollout_keys, results_dir, x_display_name=x_dn,
+    )
+    visualize_token_stability_across_layers(
+        all_results, rollout_keys, results_dir, x_display_name=x_dn,
+    )
+
+    # Dimensionality reduction
+    print("Running t-SNE...")
+    visualize_tsne(
+        all_vectors, rollout_keys, results_dir,
+        x_display_name=x_dn, perplexity=tsne_perplexity, seed=seed,
+    )
+
+    print("Running UMAP...")
+    visualize_umap(
+        all_vectors, rollout_keys, results_dir,
+        x_display_name=x_dn, seed=seed,
+    )
+
+    print("Generating within-series cosine similarity plots...")
+    visualize_within_series_cosine_similarity(
+        all_vectors, rollout_keys, results_dir,
+        x_display_name=x_dn,
+    )
 
     print("\nExperiment complete!")
 
