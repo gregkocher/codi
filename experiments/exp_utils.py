@@ -222,7 +222,7 @@ def visualize_cosine_similarity_matrices(
         ax = axes[pos // cols][pos % cols]
         mat = cos_matrices[pos]
 
-        im = ax.imshow(mat, cmap="RdYlGn", aspect="equal", vmin=0.9, vmax=1.0)
+        im = ax.imshow(mat, cmap="RdYlGn", aspect="equal")
         plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
 
         label = f"Latent {pos}"
@@ -967,7 +967,7 @@ def visualize_within_series_cosine_similarity(
         vecs_normed = vecs / norms
         cos_mat = (vecs_normed @ vecs_normed.T).numpy()
 
-        im = ax.imshow(cos_mat, cmap="RdYlGn", aspect="equal", vmin=-1.0, vmax=1.0)
+        im = ax.imshow(cos_mat, cmap="RdYlGn", aspect="equal")
 
         # Annotate cells with values
         for i in range(num_positions):
