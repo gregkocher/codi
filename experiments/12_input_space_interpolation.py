@@ -35,6 +35,8 @@ from exp_utils import (
     compute_consecutive_cosine_sims,
     compute_cosine_similarity_matrices,
     compute_drift_from_first,
+    inverse_logit_lens,
+    resolve_anchor_tokens,
     visualize_consecutive_cosine_sims,
     visualize_cosine_similarity_matrices,
     visualize_drift_from_first,
@@ -224,7 +226,11 @@ def run_full_pass(
 
     Returns:
         dict with:
-          - latent_vectors: list of K+1 tensors (1, 1, hidden_dim), detached on CPU
+          - latent_vectors_pre: list of K+1 pre-prj hidden state tensors
+            (1, 1, hidden_dim), detached on CPU (last-layer hidden states
+            before the prj module, in the same space as inverse logit lens)
+          - latent_vectors_post: list of K+1 post-prj hidden state tensors
+            (1, 1, hidden_dim), detached on CPU (after the prj module)
           - latent_logit_lens: list of K+1 logit lens results (Latent 0 .. Latent K)
           - generated_text: decoded answer string
           - generated_tokens: list of token ids
@@ -236,7 +242,8 @@ def run_full_pass(
 
     input_ids, attention_mask = prepare_inputs(model, tokenizer, prompt)
 
-    latent_vectors = []
+    latent_vectors_pre = []   # pre-prj hidden states
+    latent_vectors_post = []  # post-prj hidden states
     latent_logit_lens = []
 
     with torch.no_grad():
@@ -251,11 +258,13 @@ def run_full_pass(
         past_kv = outputs.past_key_values
 
         # Initial latent embedding — extracted from prefill
-        latent_embd = outputs.hidden_states[-1][:, -1, :].unsqueeze(1)
+        raw_hidden = outputs.hidden_states[-1][:, -1, :].unsqueeze(1)
+        latent_vectors_pre.append(raw_hidden.detach().cpu().clone())
         if model.use_prj:
-            latent_embd = model.prj(latent_embd).to(dtype=model.codi.dtype)
-
-        latent_vectors.append(latent_embd.detach().cpu().clone())
+            latent_embd = model.prj(raw_hidden).to(dtype=model.codi.dtype)
+        else:
+            latent_embd = raw_hidden
+        latent_vectors_post.append(latent_embd.detach().cpu().clone())
 
         # Logit lens on prefill output (latent vector 0)
         lens_result = logit_lens(
@@ -274,11 +283,13 @@ def run_full_pass(
             )
             past_kv = outputs.past_key_values
 
-            latent_embd = outputs.hidden_states[-1][:, -1, :].unsqueeze(1)
+            raw_hidden = outputs.hidden_states[-1][:, -1, :].unsqueeze(1)
+            latent_vectors_pre.append(raw_hidden.detach().cpu().clone())
             if model.use_prj:
-                latent_embd = model.prj(latent_embd).to(dtype=model.codi.dtype)
-
-            latent_vectors.append(latent_embd.detach().cpu().clone())
+                latent_embd = model.prj(raw_hidden).to(dtype=model.codi.dtype)
+            else:
+                latent_embd = raw_hidden
+            latent_vectors_post.append(latent_embd.detach().cpu().clone())
 
             lens_result = logit_lens(
                 outputs.hidden_states, lm_head, layer_norm,
@@ -318,7 +329,8 @@ def run_full_pass(
 
     generated_text = tokenizer.decode(generated_tokens, skip_special_tokens=False)
     return {
-        "latent_vectors": latent_vectors,
+        "latent_vectors_pre": latent_vectors_pre,
+        "latent_vectors_post": latent_vectors_post,
         "latent_logit_lens": latent_logit_lens,
         "generated_text": generated_text,
         "generated_tokens": generated_tokens,
@@ -427,6 +439,7 @@ def main(
     max_new_tokens: int = 128,
     logit_lens_layers: list[int] | None = None,
     tsne_perplexity: float = 5.0,
+    anchor_tokens: list[str] | None = None,
 ):
     """
     Input-space interpolation: vary a single number X in a math word problem,
@@ -449,6 +462,8 @@ def main(
         max_new_tokens: Max answer tokens.
         logit_lens_layers: Layer indices for logit lens (None = all).
         tsne_perplexity: Perplexity for t-SNE.
+        anchor_tokens: List of token strings to back-project and overlay on t-SNE/UMAP.
+            None (default) means no anchors. E.g. ["+","-","0","1","100"].
     """
     load_dotenv()
 
@@ -532,7 +547,8 @@ def main(
 
     # ---- Run all prompts ----
     all_results = {}  # X -> result dict
-    all_vectors = {}  # X -> list of latent vectors (CPU tensors)
+    all_vectors_pre = {}   # X -> list of pre-prj latent vectors (CPU tensors)
+    all_vectors_post = {}  # X -> list of post-prj latent vectors (CPU tensors)
 
     for x in x_values:
         prompt = template.replace("{X}", str(x))
@@ -567,7 +583,8 @@ def main(
             f"correct={result['correct']}  (GT={ground_truth})"
         )
 
-        all_vectors[x] = result.pop("latent_vectors")  # keep vectors separate
+        all_vectors_pre[x] = result.pop("latent_vectors_pre")
+        all_vectors_post[x] = result.pop("latent_vectors_post")
         all_results[x] = result
 
     # ---- Summary ----
@@ -577,15 +594,17 @@ def main(
     num_correct = sum(1 for x in x_values if all_results[x]["correct"])
     print(f"\nCorrect: {num_correct}/{len(x_values)}")
 
-    # ---- Analysis ----
-    print("\nComputing cosine similarity matrices...")
-    cos_matrices = compute_cosine_similarity_matrices(all_vectors, x_values)
+    # ---- Analysis (pre-prj) ----
+    print("\nComputing cosine similarity matrices (pre-prj)...")
+    cos_matrices_pre = compute_cosine_similarity_matrices(all_vectors_pre, x_values)
+    consec_sims_pre = compute_consecutive_cosine_sims(all_vectors_pre, x_values)
+    drift_pre = compute_drift_from_first(all_vectors_pre, x_values)
 
-    print("Computing consecutive cosine similarities...")
-    consec_sims = compute_consecutive_cosine_sims(all_vectors, x_values)
-
-    print("Computing drift from first input...")
-    drift = compute_drift_from_first(all_vectors, x_values)
+    # ---- Analysis (post-prj) ----
+    print("Computing cosine similarity matrices (post-prj)...")
+    cos_matrices_post = compute_cosine_similarity_matrices(all_vectors_post, x_values)
+    consec_sims_post = compute_consecutive_cosine_sims(all_vectors_post, x_values)
+    drift_post = compute_drift_from_first(all_vectors_post, x_values)
 
     # ---- Save JSON ----
     json_results = {
@@ -616,13 +635,13 @@ def main(
             "latent_logit_lens": r["latent_logit_lens"],
         })
 
-    # Add analysis summaries
+    # Add analysis summaries (pre-prj only for JSON; post-prj is in plots)
     json_results["analysis"] = {
         "consecutive_cosine_sims": {
-            str(pos): sims for pos, sims in consec_sims.items()
+            str(pos): sims for pos, sims in consec_sims_pre.items()
         },
         "drift_from_first": {
-            str(pos): sims for pos, sims in drift.items()
+            str(pos): sims for pos, sims in drift_pre.items()
         },
     }
 
@@ -636,10 +655,33 @@ def main(
     visualize_answer_vs_x(all_results, x_values, gt_label_str, results_dir)
     visualize_logit_lens_heatmap(all_results, x_values, tokenizer, results_dir)
     visualize_logit_lens_heatmap_top5(all_results, x_values, tokenizer, results_dir)
-    visualize_cosine_similarity_matrices(cos_matrices, x_values, results_dir)
-    visualize_drift_from_first(drift, x_values, results_dir)
-    visualize_consecutive_cosine_sims(consec_sims, x_values, results_dir)
-    visualize_vector_norms(all_vectors, x_values, results_dir)
+
+    # ---- Vector-dependent plots: pre-prj and post-prj ----
+    for suffix, tsuffix, vecs, cos_m, csims, dft in [
+        ("_pre_prj", " (Pre-Projection)", all_vectors_pre, cos_matrices_pre, consec_sims_pre, drift_pre),
+        ("_post_prj", " (Post-Projection)", all_vectors_post, cos_matrices_post, consec_sims_post, drift_post),
+    ]:
+        print(f"\n--- Vector plots{tsuffix} ---")
+        visualize_cosine_similarity_matrices(
+            cos_m, x_values, results_dir,
+            filename_suffix=suffix, title_suffix=tsuffix,
+        )
+        visualize_drift_from_first(
+            dft, x_values, results_dir,
+            filename_suffix=suffix, title_suffix=tsuffix,
+        )
+        visualize_consecutive_cosine_sims(
+            csims, x_values, results_dir,
+            filename_suffix=suffix, title_suffix=tsuffix,
+        )
+        visualize_vector_norms(
+            vecs, x_values, results_dir,
+            filename_suffix=suffix, title_suffix=tsuffix,
+        )
+        visualize_within_series_cosine_similarity(
+            vecs, x_values, results_dir, x_display_name="X",
+            filename_suffix=suffix, title_suffix=tsuffix,
+        )
 
     # ---- Per-layer logit lens heatmaps ----
     num_ll_layers = len(
@@ -664,17 +706,47 @@ def main(
         all_results, x_values, results_dir,
     )
 
-    print("Running t-SNE...")
-    visualize_tsne(all_vectors, x_values, results_dir,
-                   perplexity=tsne_perplexity, seed=seed)
+    # ---- Optionally compute anchor token vectors for t-SNE / UMAP overlays ----
+    anchor_vecs_pre = None
+    anchor_vecs_post = None
+    anchor_labels_resolved = None
+    if anchor_tokens is not None:
+        print("\nResolving anchor tokens for t-SNE/UMAP overlays...")
+        anchor_ids, anchor_labels_resolved = resolve_anchor_tokens(
+            anchor_tokens, tokenizer
+        )
+        # Pre-prj anchors (inverse logit lens space)
+        anchor_vecs_pre = inverse_logit_lens(
+            torch.tensor(anchor_ids), lm_head, layer_norm,
+        ).numpy()
+        # Post-prj anchors: pass pre-prj vectors through prj module
+        if model.use_prj:
+            with torch.no_grad():
+                pre_tensor = torch.tensor(anchor_vecs_pre, dtype=model.codi.dtype).to(model.codi.device)
+                anchor_vecs_post = model.prj(pre_tensor.unsqueeze(1)).squeeze(1).cpu().float().numpy()
+        else:
+            anchor_vecs_post = anchor_vecs_pre.copy()
+        print(f"  {len(anchor_ids)} anchor tokens resolved")
 
-    print("Running UMAP...")
-    visualize_umap(all_vectors, x_values, results_dir, seed=seed)
+    # ---- t-SNE / UMAP: pre-prj and post-prj ----
+    for suffix, tsuffix, vecs, anchors in [
+        ("_pre_prj", " (Pre-Projection)", all_vectors_pre, anchor_vecs_pre),
+        ("_post_prj", " (Post-Projection)", all_vectors_post, anchor_vecs_post),
+    ]:
+        print(f"\nRunning t-SNE{tsuffix}...")
+        visualize_tsne(
+            vecs, x_values, results_dir,
+            perplexity=tsne_perplexity, seed=seed,
+            anchor_vectors=anchors, anchor_labels=anchor_labels_resolved,
+            filename_suffix=suffix, title_suffix=tsuffix,
+        )
 
-    print("Generating within-series cosine similarity plots...")
-    visualize_within_series_cosine_similarity(
-        all_vectors, x_values, results_dir, x_display_name="X",
-    )
+        print(f"Running UMAP{tsuffix}...")
+        visualize_umap(
+            vecs, x_values, results_dir, seed=seed,
+            anchor_vectors=anchors, anchor_labels=anchor_labels_resolved,
+            filename_suffix=suffix, title_suffix=tsuffix,
+        )
 
     print("\nExperiment complete!")
 

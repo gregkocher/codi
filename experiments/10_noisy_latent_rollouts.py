@@ -36,6 +36,8 @@ from exp_utils import (
     compute_consecutive_cosine_sims,
     compute_cosine_similarity_matrices,
     compute_drift_from_first,
+    inverse_logit_lens,
+    resolve_anchor_tokens,
     visualize_consecutive_cosine_sims,
     visualize_cosine_similarity_matrices,
     visualize_drift_from_first,
@@ -159,7 +161,8 @@ def run_batched_noisy_rollouts(
           - generated_text: decoded answer string
           - generated_tokens: list of token ids
           - latent_logit_lens: list of K+1 dicts (Latent 0..K)
-          - latent_vectors: list of K+1 tensors (1, 1, hidden_dim) on CPU
+          - latent_vectors_pre: list of K+1 pre-prj tensors (1, 1, hidden_dim) on CPU
+          - latent_vectors_post: list of K+1 post-prj tensors (1, 1, hidden_dim) on CPU
     """
     device = model.codi.device
     N = num_rollouts
@@ -195,7 +198,8 @@ def run_batched_noisy_rollouts(
     pad_id = tokenizer.pad_token_id or 0
 
     all_latent_logit_lens = [[] for _ in range(N)]
-    all_latent_vectors = [[] for _ in range(N)]
+    all_latent_vectors_pre = [[] for _ in range(N)]   # pre-prj
+    all_latent_vectors_post = [[] for _ in range(N)]  # post-prj
 
     with torch.no_grad():
         # ----- Step 1: Prefill once (batch_size=1) -----
@@ -221,12 +225,20 @@ def run_batched_noisy_rollouts(
         past_kv = expand_kv_cache(outputs.past_key_values, N)
 
         # Initial latent embedding: (1, 1, hidden) -> (N, 1, hidden)
-        latent_embd = outputs.hidden_states[-1][:, -1, :].unsqueeze(1)
-        latent_embd = latent_embd.expand(N, -1, -1).clone()
+        raw_hidden = outputs.hidden_states[-1][:, -1, :].unsqueeze(1)
+        raw_hidden_expanded = raw_hidden.expand(N, -1, -1).clone()
+
+        # Store pre-prj hidden state for each rollout (Latent 0)
+        for b in range(N):
+            all_latent_vectors_pre[b].append(
+                raw_hidden_expanded[b : b + 1].detach().cpu().clone()
+            )
 
         # Project
         if model.use_prj:
-            latent_embd = model.prj(latent_embd).to(dtype=model.codi.dtype)
+            latent_embd = model.prj(raw_hidden_expanded).to(dtype=model.codi.dtype)
+        else:
+            latent_embd = raw_hidden_expanded
 
         # Noise at position 0
         if noise_positions is not None and 0 in noise_positions:
@@ -234,9 +246,9 @@ def run_batched_noisy_rollouts(
                 latent_embd, noise_scale, generators
             )
 
-        # Store Latent 0 vector for each rollout
+        # Store post-prj (after projection + noise) for each rollout (Latent 0)
         for b in range(N):
-            all_latent_vectors[b].append(
+            all_latent_vectors_post[b].append(
                 latent_embd[b : b + 1].detach().cpu().clone()
             )
 
@@ -262,10 +274,18 @@ def run_batched_noisy_rollouts(
                 )
 
             # Next latent embedding
-            latent_embd = outputs.hidden_states[-1][:, -1, :].unsqueeze(1)
+            raw_hidden = outputs.hidden_states[-1][:, -1, :].unsqueeze(1)
+
+            # Store pre-prj hidden state for each rollout
+            for b in range(N):
+                all_latent_vectors_pre[b].append(
+                    raw_hidden[b : b + 1].detach().cpu().clone()
+                )
 
             if model.use_prj:
-                latent_embd = model.prj(latent_embd).to(dtype=model.codi.dtype)
+                latent_embd = model.prj(raw_hidden).to(dtype=model.codi.dtype)
+            else:
+                latent_embd = raw_hidden
 
             # Noise at this position (1-indexed)
             if noise_positions is not None and (i + 1) in noise_positions:
@@ -273,9 +293,9 @@ def run_batched_noisy_rollouts(
                     latent_embd, noise_scale, generators
                 )
 
-            # Store latent vector for each rollout
+            # Store post-prj (after projection + noise) for each rollout
             for b in range(N):
-                all_latent_vectors[b].append(
+                all_latent_vectors_post[b].append(
                     latent_embd[b : b + 1].detach().cpu().clone()
                 )
 
@@ -329,7 +349,8 @@ def run_batched_noisy_rollouts(
                 "generated_text": text,
                 "generated_tokens": generated_tokens[b],
                 "latent_logit_lens": all_latent_logit_lens[b],
-                "latent_vectors": all_latent_vectors[b],
+                "latent_vectors_pre": all_latent_vectors_pre[b],
+                "latent_vectors_post": all_latent_vectors_post[b],
             }
         )
 
@@ -423,6 +444,7 @@ def main(
     max_new_tokens: int = 128,
     logit_lens_layers: list[int] | None = None,
     tsne_perplexity: float = 5.0,
+    anchor_tokens: list[str] | None = None,
 ):
     """
     Run N noisy rollouts on a single prompt with logit lens analysis (batched).
@@ -446,6 +468,8 @@ def main(
         logit_lens_layers: Layer indices for logit lens. None = all layers.
             E.g. [-4,-3,-2,-1] for last 4 layers only (big speedup).
         tsne_perplexity: Perplexity for t-SNE.
+        anchor_tokens: List of token strings to back-project and overlay on t-SNE/UMAP.
+            None (default) means no anchors. E.g. ["+","-","0","1","100"].
     """
     load_dotenv()
 
@@ -536,11 +560,13 @@ def main(
     # Build dicts keyed by rollout index, matching experiment 12's data format
     rollout_keys = list(range(num_rollouts))  # [0, 1, 2, ..., N-1]
 
-    all_results = {}   # rollout_idx -> result dict (with latent_logit_lens)
-    all_vectors = {}   # rollout_idx -> list of K+1 tensors
+    all_results = {}        # rollout_idx -> result dict (with latent_logit_lens)
+    all_vectors_pre = {}    # rollout_idx -> list of K+1 pre-prj tensors
+    all_vectors_post = {}   # rollout_idx -> list of K+1 post-prj tensors
 
     for r_idx, result in enumerate(all_rollout_results):
-        all_vectors[r_idx] = result.pop("latent_vectors")
+        all_vectors_pre[r_idx] = result.pop("latent_vectors_pre")
+        all_vectors_post[r_idx] = result.pop("latent_vectors_post")
         all_results[r_idx] = result
 
     # ---- Save JSON ----
@@ -604,29 +630,40 @@ def main(
     # Accuracy fraction bar chart
     visualize_accuracy_fraction(all_rollout_results, results_dir)
 
-    # Cosine similarity analysis
-    print("\nComputing cosine similarity matrices...")
-    cos_matrices = compute_cosine_similarity_matrices(all_vectors, rollout_keys)
-    visualize_cosine_similarity_matrices(
-        cos_matrices, rollout_keys, results_dir, x_display_name=x_dn,
-    )
+    # ---- Vector-dependent plots: pre-prj and post-prj ----
+    for suffix, tsuffix, vecs in [
+        ("_pre_prj", " (Pre-Projection)", all_vectors_pre),
+        ("_post_prj", " (Post-Projection)", all_vectors_post),
+    ]:
+        print(f"\n--- Vector plots{tsuffix} ---")
 
-    print("Computing consecutive cosine similarities...")
-    consec_sims = compute_consecutive_cosine_sims(all_vectors, rollout_keys)
-    visualize_consecutive_cosine_sims(
-        consec_sims, rollout_keys, results_dir, x_display_name=x_dn,
-    )
+        cos_matrices = compute_cosine_similarity_matrices(vecs, rollout_keys)
+        visualize_cosine_similarity_matrices(
+            cos_matrices, rollout_keys, results_dir, x_display_name=x_dn,
+            filename_suffix=suffix, title_suffix=tsuffix,
+        )
 
-    print("Computing drift from first rollout...")
-    drift = compute_drift_from_first(all_vectors, rollout_keys)
-    visualize_drift_from_first(
-        drift, rollout_keys, results_dir, x_display_name=x_dn,
-    )
+        consec_sims = compute_consecutive_cosine_sims(vecs, rollout_keys)
+        visualize_consecutive_cosine_sims(
+            consec_sims, rollout_keys, results_dir, x_display_name=x_dn,
+            filename_suffix=suffix, title_suffix=tsuffix,
+        )
 
-    # Vector norms
-    visualize_vector_norms(
-        all_vectors, rollout_keys, results_dir, x_display_name=x_dn,
-    )
+        drift = compute_drift_from_first(vecs, rollout_keys)
+        visualize_drift_from_first(
+            drift, rollout_keys, results_dir, x_display_name=x_dn,
+            filename_suffix=suffix, title_suffix=tsuffix,
+        )
+
+        visualize_vector_norms(
+            vecs, rollout_keys, results_dir, x_display_name=x_dn,
+            filename_suffix=suffix, title_suffix=tsuffix,
+        )
+
+        visualize_within_series_cosine_similarity(
+            vecs, rollout_keys, results_dir, x_display_name=x_dn,
+            filename_suffix=suffix, title_suffix=tsuffix,
+        )
 
     # Per-layer logit lens heatmaps
     num_ll_layers = len(
@@ -656,24 +693,48 @@ def main(
         all_results, rollout_keys, results_dir, x_display_name=x_dn,
     )
 
-    # Dimensionality reduction
-    print("Running t-SNE...")
-    visualize_tsne(
-        all_vectors, rollout_keys, results_dir,
-        x_display_name=x_dn, perplexity=tsne_perplexity, seed=seed,
-    )
+    # ---- Optionally compute anchor token vectors for t-SNE / UMAP overlays ----
+    anchor_vecs_pre = None
+    anchor_vecs_post = None
+    anchor_labels_resolved = None
+    if anchor_tokens is not None:
+        print("\nResolving anchor tokens for t-SNE/UMAP overlays...")
+        anchor_ids, anchor_labels_resolved = resolve_anchor_tokens(
+            anchor_tokens, tokenizer
+        )
+        # Pre-prj anchors (inverse logit lens space)
+        anchor_vecs_pre = inverse_logit_lens(
+            torch.tensor(anchor_ids), lm_head, layer_norm,
+        ).numpy()
+        # Post-prj anchors: pass pre-prj vectors through prj module
+        if model.use_prj:
+            with torch.no_grad():
+                pre_tensor = torch.tensor(anchor_vecs_pre, dtype=model.codi.dtype).to(model.codi.device)
+                anchor_vecs_post = model.prj(pre_tensor.unsqueeze(1)).squeeze(1).cpu().float().numpy()
+        else:
+            anchor_vecs_post = anchor_vecs_pre.copy()
+        print(f"  {len(anchor_ids)} anchor tokens resolved")
 
-    print("Running UMAP...")
-    visualize_umap(
-        all_vectors, rollout_keys, results_dir,
-        x_display_name=x_dn, seed=seed,
-    )
+    # ---- t-SNE / UMAP: pre-prj and post-prj ----
+    for suffix, tsuffix, vecs, anchors in [
+        ("_pre_prj", " (Pre-Projection)", all_vectors_pre, anchor_vecs_pre),
+        ("_post_prj", " (Post-Projection)", all_vectors_post, anchor_vecs_post),
+    ]:
+        print(f"\nRunning t-SNE{tsuffix}...")
+        visualize_tsne(
+            vecs, rollout_keys, results_dir,
+            x_display_name=x_dn, perplexity=tsne_perplexity, seed=seed,
+            anchor_vectors=anchors, anchor_labels=anchor_labels_resolved,
+            filename_suffix=suffix, title_suffix=tsuffix,
+        )
 
-    print("Generating within-series cosine similarity plots...")
-    visualize_within_series_cosine_similarity(
-        all_vectors, rollout_keys, results_dir,
-        x_display_name=x_dn,
-    )
+        print(f"Running UMAP{tsuffix}...")
+        visualize_umap(
+            vecs, rollout_keys, results_dir,
+            x_display_name=x_dn, seed=seed,
+            anchor_vectors=anchors, anchor_labels=anchor_labels_resolved,
+            filename_suffix=suffix, title_suffix=tsuffix,
+        )
 
     print("\nExperiment complete!")
 

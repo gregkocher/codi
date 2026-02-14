@@ -12,6 +12,86 @@ from sklearn.manifold import TSNE
 
 
 # ============================================================================
+# Default Anchor Tokens for t-SNE / UMAP overlays
+# ============================================================================
+
+DEFAULT_ANCHOR_TOKENS = [
+    "+", "-", "*", "/", "=",
+    "0", "1", "2", "3", "4", "5", "6", "7", "8", "9",
+    "10", "50", "100", "1000", "1850", "1997", "2026", "100000",
+]
+
+
+# ============================================================================
+# Inverse Logit Lens
+# ============================================================================
+
+
+def inverse_logit_lens(token_ids, lm_head, layer_norm, reference_norm=None):
+    """
+    Back-project token IDs from vocabulary space to last-layer hidden-state
+    space by inverting the logit lens pipeline (lm_head + RMSNorm gain).
+
+    Forward logit lens: hidden → RMSNorm(hidden) → lm_head → logits
+    Inverse:            token_id → W[token_id] / g → direction in hidden space
+
+    Args:
+        token_ids: 1-D tensor of token IDs to back-project.
+        lm_head: The model's lm_head module (nn.Linear).
+        layer_norm: The final RMSNorm module (has .weight = gain vector g).
+        reference_norm: If provided, scale each vector to this L2 norm.
+            If None, vectors are unit-normalized.
+
+    Returns:
+        Tensor of shape (len(token_ids), hidden_dim) in float32, on CPU.
+    """
+    with torch.no_grad():
+        W = lm_head.weight.float()          # (vocab_size, hidden_dim)
+        g = layer_norm.weight.float()        # (hidden_dim,)
+        vecs = W[token_ids] / g              # undo RMSNorm gain
+        # Unit-normalize each vector
+        vecs = vecs / vecs.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+        if reference_norm is not None:
+            vecs = vecs * reference_norm
+    return vecs.cpu()
+
+
+def resolve_anchor_tokens(anchor_strings, tokenizer):
+    """
+    Convert a list of human-readable token strings to token IDs.
+    For multi-token strings, use the *first* sub-token.
+
+    Args:
+        anchor_strings: List of strings, e.g. ["+", "100000"].
+        tokenizer: HuggingFace tokenizer.
+
+    Returns:
+        (token_ids, display_labels): Both lists of the same length.
+            token_ids: list of int token IDs.
+            display_labels: list of str display labels (original string,
+                with a note if it was truncated to the first sub-token).
+    """
+    token_ids = []
+    display_labels = []
+    for s in anchor_strings:
+        ids = tokenizer.encode(s, add_special_tokens=False)
+        if len(ids) == 0:
+            print(f"  [anchor] Skipping {s!r}: tokenizer returned empty")
+            continue
+        tid = ids[0]
+        decoded = tokenizer.decode([tid])
+        if len(ids) == 1:
+            label = s
+        else:
+            label = f"{s}→{decoded.strip()}"
+            print(f"  [anchor] {s!r} is multi-token ({len(ids)} tokens), "
+                  f"using first sub-token: {decoded!r} (id={tid})")
+        token_ids.append(tid)
+        display_labels.append(label)
+    return token_ids, display_labels
+
+
+# ============================================================================
 # Compute / Analysis Functions
 # ============================================================================
 
@@ -123,9 +203,29 @@ def _x_color_norm(x_values):
     return plt.Normalize(vmin=x_min, vmax=x_max)
 
 
+def _overlay_anchors(ax, anchor_embeddings, anchor_labels):
+    """Overlay back-projected token anchor points on a 2-D embedding plot."""
+    if anchor_embeddings is None or len(anchor_embeddings) == 0:
+        return
+    ax.scatter(
+        anchor_embeddings[:, 0], anchor_embeddings[:, 1],
+        c="black", s=80, marker="D", zorder=10,
+        edgecolors="white", linewidth=0.8, label="Token anchors",
+    )
+    for i, label in enumerate(anchor_labels):
+        ax.annotate(
+            label,
+            (anchor_embeddings[i, 0], anchor_embeddings[i, 1]),
+            fontsize=7, color="black", fontweight="bold",
+            xytext=(5, 5), textcoords="offset points",
+            zorder=11,
+        )
+
+
 def _plot_embeddings_by_position(
     embeddings, labels_position, x_values, num_positions, ax, method_name,
-    x_display_name="X",
+    x_display_name="X", anchor_embeddings=None, anchor_labels=None,
+    title_suffix="",
 ):
     """Plot 2-D embeddings colored by latent position with connecting lines."""
     cmap = plt.cm.tab10
@@ -155,11 +255,13 @@ def _plot_embeddings_by_position(
             fontsize=6, color=color, alpha=0.8,
         )
 
+    _overlay_anchors(ax, anchor_embeddings, anchor_labels)
+
     ax.set_xlabel(f"{method_name} dim 1", fontsize=12)
     ax.set_ylabel(f"{method_name} dim 2", fontsize=12)
     ax.set_title(
         f"{method_name} of Latent Vectors "
-        f"(colored by position, connected across {x_display_name})",
+        f"(colored by position, connected across {x_display_name}){title_suffix}",
         fontsize=14, fontweight="bold",
     )
     ax.legend(fontsize=9, loc="best")
@@ -168,7 +270,8 @@ def _plot_embeddings_by_position(
 
 def _plot_embeddings_by_x(
     embeddings, labels_x, x_values, ax, method_name,
-    x_display_name="X",
+    x_display_name="X", anchor_embeddings=None, anchor_labels=None,
+    title_suffix="",
 ):
     """Plot 2-D embeddings colored by key value with connecting lines."""
     norm = _x_color_norm(x_values)
@@ -188,6 +291,8 @@ def _plot_embeddings_by_x(
             c=[color], s=50, zorder=2, edgecolors="white", linewidth=0.5,
         )
 
+    _overlay_anchors(ax, anchor_embeddings, anchor_labels)
+
     sm = plt.cm.ScalarMappable(cmap=cmap_x, norm=norm)
     sm.set_array([])
     cbar = plt.colorbar(sm, ax=ax)
@@ -197,7 +302,7 @@ def _plot_embeddings_by_x(
     ax.set_ylabel(f"{method_name} dim 2", fontsize=12)
     ax.set_title(
         f"{method_name} of Latent Vectors "
-        f"(colored by {x_display_name}, connected across positions)",
+        f"(colored by {x_display_name}, connected across positions){title_suffix}",
         fontsize=14, fontweight="bold",
     )
     ax.grid(True, alpha=0.2)
@@ -210,6 +315,7 @@ def _plot_embeddings_by_x(
 
 def visualize_cosine_similarity_matrices(
     cos_matrices, x_values, results_dir, x_display_name="X",
+    filename_suffix="", title_suffix="",
 ):
     """One heatmap per latent position showing pairwise cosine similarity."""
     num_positions = len(cos_matrices)
@@ -241,11 +347,11 @@ def visualize_cosine_similarity_matrices(
         axes[idx // cols][idx % cols].axis("off")
 
     plt.suptitle(
-        f"Pairwise Cosine Similarity of Latent Vectors Across {x_display_name}",
+        f"Pairwise Cosine Similarity of Latent Vectors Across {x_display_name}{title_suffix}",
         fontsize=14, fontweight="bold", y=1.01,
     )
     plt.tight_layout()
-    path = results_dir / "cosine_similarity_matrices.png"
+    path = results_dir / f"cosine_similarity_matrices{filename_suffix}.png"
     fig.savefig(path, dpi=200, bbox_inches="tight", facecolor="white")
     plt.close(fig)
     print(f"Saved: {path}")
@@ -253,6 +359,7 @@ def visualize_cosine_similarity_matrices(
 
 def visualize_drift_from_first(
     drift, x_values, results_dir, x_display_name="X",
+    filename_suffix="", title_suffix="",
 ):
     """
     Line plot: for each latent position, how does cosine similarity to the
@@ -281,7 +388,7 @@ def visualize_drift_from_first(
         fontsize=13, fontweight="bold",
     )
     ax.set_title(
-        f"Latent Vector Drift from First {x_display_name}",
+        f"Latent Vector Drift from First {x_display_name}{title_suffix}",
         fontsize=15, fontweight="bold",
     )
     ax.legend(fontsize=9, loc="lower left")
@@ -290,7 +397,7 @@ def visualize_drift_from_first(
     ax.set_xticklabels(x_labels, fontsize=7, rotation=45, ha="right")
 
     plt.tight_layout()
-    path = results_dir / "drift_from_first.png"
+    path = results_dir / f"drift_from_first{filename_suffix}.png"
     fig.savefig(path, dpi=200, bbox_inches="tight", facecolor="white")
     plt.close(fig)
     print(f"Saved: {path}")
@@ -298,6 +405,7 @@ def visualize_drift_from_first(
 
 def visualize_consecutive_cosine_sims(
     consec_sims, x_values, results_dir, x_display_name="X",
+    filename_suffix="", title_suffix="",
 ):
     """
     Line plot: cosine similarity between consecutive keys for each
@@ -330,7 +438,7 @@ def visualize_consecutive_cosine_sims(
         fontsize=13, fontweight="bold",
     )
     ax.set_title(
-        f"Consecutive Cosine Similarity Between Adjacent {x_display_name}s",
+        f"Consecutive Cosine Similarity Between Adjacent {x_display_name}s{title_suffix}",
         fontsize=15, fontweight="bold",
     )
     ax.legend(fontsize=9)
@@ -339,7 +447,7 @@ def visualize_consecutive_cosine_sims(
     ax.set_xticklabels(midpoint_labels, fontsize=6, rotation=45, ha="right")
 
     plt.tight_layout()
-    path = results_dir / "consecutive_cosine_similarity.png"
+    path = results_dir / f"consecutive_cosine_similarity{filename_suffix}.png"
     fig.savefig(path, dpi=200, bbox_inches="tight", facecolor="white")
     plt.close(fig)
     print(f"Saved: {path}")
@@ -347,6 +455,7 @@ def visualize_consecutive_cosine_sims(
 
 def visualize_vector_norms(
     all_vectors, x_values, results_dir, x_display_name="X",
+    filename_suffix="", title_suffix="",
 ):
     """
     Plot L2 norms of latent vectors across keys for each position.
@@ -376,7 +485,7 @@ def visualize_vector_norms(
     ax.set_xlabel(x_display_name, fontsize=13, fontweight="bold")
     ax.set_ylabel("L2 Norm", fontsize=13, fontweight="bold")
     ax.set_title(
-        f"Latent Vector L2 Norms vs {x_display_name}",
+        f"Latent Vector L2 Norms vs {x_display_name}{title_suffix}",
         fontsize=15, fontweight="bold",
     )
     ax.legend(fontsize=9)
@@ -385,7 +494,7 @@ def visualize_vector_norms(
     ax.set_xticklabels(x_labels, fontsize=7, rotation=45, ha="right")
 
     plt.tight_layout()
-    path = results_dir / "vector_norms.png"
+    path = results_dir / f"vector_norms{filename_suffix}.png"
     fig.savefig(path, dpi=200, bbox_inches="tight", facecolor="white")
     plt.close(fig)
     print(f"Saved: {path}")
@@ -394,30 +503,53 @@ def visualize_vector_norms(
 def visualize_tsne(
     all_vectors, x_values, results_dir,
     x_display_name="X", perplexity=5, seed=42,
+    anchor_vectors=None, anchor_labels=None,
+    filename_suffix="", title_suffix="",
 ):
     """
     t-SNE plot of all latent vectors. Two sub-plots: colored by latent
     position and colored by key value.
+
+    If anchor_vectors is provided (numpy array of shape (A, hidden_dim)),
+    those points are included in the t-SNE fitting and overlaid as black
+    diamond markers with text labels.
     """
     all_vecs, labels_position, labels_x, num_positions = _flatten_vectors(
         all_vectors, x_values
     )
+    n_latent = len(all_vecs)
 
-    effective_perplexity = min(perplexity, max(2, len(all_vecs) // 4))
+    # Concatenate anchor vectors so they influence the t-SNE layout
+    if anchor_vectors is not None and len(anchor_vectors) > 0:
+        combined = np.concatenate([all_vecs, anchor_vectors], axis=0)
+    else:
+        combined = all_vecs
+
+    # Unit-normalize all vectors so only direction matters
+    norms = np.linalg.norm(combined, axis=-1, keepdims=True)
+    norms = np.clip(norms, 1e-8, None)
+    combined = combined / norms
+
+    effective_perplexity = min(perplexity, max(2, len(combined) // 4))
     tsne = TSNE(
         n_components=2, perplexity=effective_perplexity,
         random_state=seed, max_iter=2000, learning_rate="auto", init="pca",
     )
-    embeddings = tsne.fit_transform(all_vecs)
+    all_embeddings = tsne.fit_transform(combined)
+
+    embeddings = all_embeddings[:n_latent]
+    anchor_emb = all_embeddings[n_latent:] if anchor_vectors is not None and len(anchor_vectors) > 0 else None
 
     # Plot 1: colored by latent position
     fig, ax = plt.subplots(figsize=(12, 9))
     _plot_embeddings_by_position(
         embeddings, labels_position, x_values, num_positions, ax, "t-SNE",
         x_display_name=x_display_name,
+        anchor_embeddings=anchor_emb, anchor_labels=anchor_labels,
+        title_suffix=title_suffix,
     )
     plt.tight_layout()
-    path = results_dir / "tsne_by_position.png"
+    path = results_dir / f"tsne_by_position{filename_suffix}.png"
     fig.savefig(path, dpi=200, bbox_inches="tight", facecolor="white")
     plt.close(fig)
     print(f"Saved: {path}")
@@ -427,9 +559,11 @@ def visualize_tsne(
     _plot_embeddings_by_x(
         embeddings, labels_x, x_values, ax, "t-SNE",
         x_display_name=x_display_name,
+        anchor_embeddings=anchor_emb, anchor_labels=anchor_labels,
+        title_suffix=title_suffix,
     )
     plt.tight_layout()
-    path = results_dir / "tsne_by_x_value.png"
+    path = results_dir / f"tsne_by_x_value{filename_suffix}.png"
     fig.savefig(path, dpi=200, bbox_inches="tight", facecolor="white")
     plt.close(fig)
     print(f"Saved: {path}")
@@ -438,30 +572,53 @@ def visualize_tsne(
 def visualize_umap(
     all_vectors, x_values, results_dir,
     x_display_name="X", n_neighbors=15, min_dist=0.1, seed=42,
+    anchor_vectors=None, anchor_labels=None,
+    filename_suffix="", title_suffix="",
 ):
     """
     UMAP plot of all latent vectors. Same two sub-plots as t-SNE:
     colored by latent position and colored by key value.
+
+    If anchor_vectors is provided (numpy array of shape (A, hidden_dim)),
+    those points are included in the UMAP fitting and overlaid as black
+    diamond markers with text labels.
     """
     all_vecs, labels_position, labels_x, num_positions = _flatten_vectors(
         all_vectors, x_values
     )
+    n_latent = len(all_vecs)
 
-    effective_neighbors = min(n_neighbors, max(2, len(all_vecs) - 1))
+    # Concatenate anchor vectors so they influence the UMAP layout
+    if anchor_vectors is not None and len(anchor_vectors) > 0:
+        combined = np.concatenate([all_vecs, anchor_vectors], axis=0)
+    else:
+        combined = all_vecs
+
+    # Unit-normalize all vectors so only direction matters
+    norms = np.linalg.norm(combined, axis=-1, keepdims=True)
+    norms = np.clip(norms, 1e-8, None)
+    combined = combined / norms
+
+    effective_neighbors = min(n_neighbors, max(2, len(combined) - 1))
     reducer = umap.UMAP(
         n_components=2, n_neighbors=effective_neighbors,
         min_dist=min_dist, random_state=seed, metric="cosine",
     )
-    embeddings = reducer.fit_transform(all_vecs)
+    all_embeddings = reducer.fit_transform(combined)
+
+    embeddings = all_embeddings[:n_latent]
+    anchor_emb = all_embeddings[n_latent:] if anchor_vectors is not None and len(anchor_vectors) > 0 else None
 
     # Plot 1: colored by latent position
     fig, ax = plt.subplots(figsize=(12, 9))
     _plot_embeddings_by_position(
         embeddings, labels_position, x_values, num_positions, ax, "UMAP",
         x_display_name=x_display_name,
+        anchor_embeddings=anchor_emb, anchor_labels=anchor_labels,
+        title_suffix=title_suffix,
     )
     plt.tight_layout()
-    path = results_dir / "umap_by_position.png"
+    path = results_dir / f"umap_by_position{filename_suffix}.png"
     fig.savefig(path, dpi=200, bbox_inches="tight", facecolor="white")
     plt.close(fig)
     print(f"Saved: {path}")
@@ -471,9 +628,11 @@ def visualize_umap(
     _plot_embeddings_by_x(
         embeddings, labels_x, x_values, ax, "UMAP",
         x_display_name=x_display_name,
+        anchor_embeddings=anchor_emb, anchor_labels=anchor_labels,
+        title_suffix=title_suffix,
     )
     plt.tight_layout()
-    path = results_dir / "umap_by_x_value.png"
+    path = results_dir / f"umap_by_x_value{filename_suffix}.png"
     fig.savefig(path, dpi=200, bbox_inches="tight", facecolor="white")
     plt.close(fig)
     print(f"Saved: {path}")
@@ -926,6 +1085,7 @@ def visualize_token_stability_across_layers(
 
 def visualize_within_series_cosine_similarity(
     all_vectors, x_values, results_dir, x_display_name="X",
+    filename_suffix="", title_suffix="",
 ):
     """
     For each key, compute a 7x7 cosine similarity matrix of that key's 7
@@ -998,11 +1158,11 @@ def visualize_within_series_cosine_similarity(
     cbar.set_label("Cosine similarity", fontsize=10)
 
     plt.suptitle(
-        f"Within-Series Cosine Similarity of Latent Vectors (per {x_display_name})",
+        f"Within-Series Cosine Similarity of Latent Vectors (per {x_display_name}){title_suffix}",
         fontsize=14, fontweight="bold", y=1.01,
     )
 
-    path = results_dir / "within_series_cosine_similarity.png"
+    path = results_dir / f"within_series_cosine_similarity{filename_suffix}.png"
     fig.savefig(path, dpi=200, bbox_inches="tight", facecolor="white")
     plt.close(fig)
     print(f"Saved: {path}")
